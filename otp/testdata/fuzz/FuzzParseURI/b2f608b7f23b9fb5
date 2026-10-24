@@ -1,0 +1,2 @@
+go test fuzz v1
+string("otpAuth://totp/\xea%3A")
