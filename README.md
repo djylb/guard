@@ -8,8 +8,11 @@ one-time passwords, and HTTP middleware against DNS rebinding and CSRF.
 - Small, focused packages that can be used on their own and compose.
 - No background goroutines: memory is bounded by configuration and
   reclaimed deterministically by the calls that use it.
-- Safe for concurrent use, with sharded locks on the hot paths. A replay
-  check and a ban check do not allocate.
+- Safe for concurrent use, with sharded locks on the hot paths. Replay,
+  ban, challenge, one-time password, CSRF token and request checks do not
+  allocate, also when they reject. The exception is a cross-origin check
+  of a request that carries Origin but no Sec-Fetch-Site, where
+  `http.CrossOriginProtection` parses the Origin.
 - Zero values never panic and never run with an empty key: types that
   hold a key report an error, a zero `failban.Limiter` reports every key
   banned, and a zero `webguard.Guard` or `CSRF` rejects requests.
@@ -31,6 +34,20 @@ Requires Go 1.26 or later.
 
 `pow` uses `replay`; the other packages are independent, and only
 `webguard` imports `net/http`.
+
+Every `Config` also decodes from JSON, so it can sit in a service's config
+file. Durations are strings such as `"15m"`, policies are names such as
+`"EvictSoonest"`, keys are standard base64, and unknown fields and nulls
+are errors rather than silent defaults. A key must be given, or asked for
+as `"random"`, valid only in this process:
+
+```go
+var conf struct {
+	Login failban.Config  `json:"login"` // {"threshold": 5, "window": "15m", "full": "LockShard"}
+	Admin webguard.Config `json:"admin"` // {"hosts": ["admin.example.com"], "trusted_proxies": ["10.0.0.2"]}
+}
+err := json.Unmarshal(data, &conf)
+```
 
 ## replay
 
@@ -65,6 +82,9 @@ if err := w.Check(msg.Time, msg.Nonce); err != nil {
 - Nonces are identified by a 128-bit keyed hash, so a check does not
   allocate. While a nonce is remembered, it is rejected with any
   timestamp.
+- **Observability.** `Stats` reports the nonces remembered, the capacity,
+  and how many nonces `ShrinkWindow` forgot early: if that grows,
+  `Capacity` is too small for the load.
 
 ## pow
 
@@ -80,22 +100,26 @@ c, err := pow.New(pow.Config{
 	Skew:       2 * time.Second, // how far ahead another issuing server's clock may run
 })
 
-binding := []byte(clientIP + "|login") // fields joined unambiguously
-token, err := c.Issue(binding)               // send to the client
-solution, err := pow.Solve(ctx, token)       // client side
-err = c.Verify(token, solution, binding)     // pow.ErrReplay on reuse
+token, err := c.Issue(clientIP, "login")            // send to the client
+solution, err := pow.Solve(ctx, token)              // client side
+err = c.Verify(token, solution, clientIP, "login")  // pow.ErrReplay on reuse
 ```
 
 Verify checks the expiry, then the work with one SHA-256 hash, then the
 signature (compared in constant time), and finally whether the challenge
 was already used, in a `Store`. A successful Verify does not allocate.
-Encode a binding of several fields unambiguously, with length prefixes
-or a separator that cannot occur in them. The default store holds up to
+The binding is a list of strings, each length-prefixed in the MAC, so
+`("ab", "c")` and `("a", "bc")` differ. The default store holds up to
 `ReplayCapacity` (64 Ki) challenges and grows with use to about 5 MiB;
 set a few thousand for a single login form.
 
+To rotate the key, make the new one `Key` and keep the old one in
+`PreviousKeys` for one TTL: challenges signed with either verify.
+
 The default store is a `MemoryStore`, a bounded `replay.Window` in
-process memory. When several instances share a key, give them one shared
+process memory. Challengers in one process may share a `MemoryStore` if
+the TTL plus skew of each fits within the store's window plus skew; `New`
+refuses one that does not. When several instances share a key, give them one shared
 `Store`, for example a key-value database with an atomic set-if-absent:
 
 ```go
@@ -108,7 +132,8 @@ type Store interface {
 
 Store errors reject the challenge (`pow.ErrStore`). `IssueDifficulty` raises
 the cost per challenge, for example while the service is under attack.
-`Parse` and `Check` let clients read and test tokens.
+`Parse` and `Check` let clients read and test tokens. `MemoryStore.Stats`
+reports the use of a store you create yourself.
 
 Browser clients can solve challenges themselves. A token is the unpadded
 base64url encoding of `version (1) | difficulty (1) | expiry ms (8) |
@@ -124,42 +149,58 @@ whether a string is an IP address or a user name.
 ```go
 // Name-keyed bans keep the default LockShard policy, so made-up names
 // cannot push out the ban on a real account (see "Full ban table").
-users := failban.MustNew[string](failban.Config{
+users, err := failban.New[string](failban.Config{
 	Threshold:      5,
 	Window:         15 * time.Minute,
 	BanDuration:    time.Minute,
 	MaxBanDuration: 24 * time.Hour, // doubles for repeat offenders
 })
-ips := failban.MustNew[netip.Prefix](failban.Config{Threshold: 20, Full: failban.EvictSoonest})
+ips, err := failban.New[netip.Prefix](failban.Config{Threshold: 20, Full: failban.EvictSoonest})
 
-prefix, err := failban.RemotePrefix(r.RemoteAddr, failban.HostBitsV4, failban.SiteBitsV6)
+prefix, err := failban.PrefixLen{V4: 32, V6: 64}.OfRemote(r.RemoteAddr)
 ip, user := ips.Attempt(prefix), users.Attempt(name)
 if !ip.Allowed() || !user.Allowed() {
-	ip.Done(true) // release whichever reservation was made
-	user.Done(true)
-	return errTooManyAttempts
+	ip.Release() // release whichever reservation was made
+	user.Release()
+	retry := max(ip.RetryAfter(), user.RetryAfter())
+	w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)))
+	http.Error(w, "too many attempts", http.StatusTooManyRequests)
+	return
 }
-ok := checkPassword(name, password) // slow, so at most Threshold run at once
-ip.Done(ok)                          // false counts a failure; true only releases
-user.Done(ok)
+if !checkPassword(name, password) { // slow, so at most Threshold run at once
+	ip.Fail()
+	if res := user.Fail(); res.Started {
+		log.Printf("%s banned until %v (offence %d)", name, res.Until, res.Offences)
+	}
+	return
+}
+ip.Release()   // keeps the prefix's failures
+user.Succeed() // clears the account's failures
 ```
 
 - **Attempts are reserved atomically.** Checking `IsBanned` before a slow
   password check and calling `Fail` after it is racy: many concurrent
   guesses all pass the check. `Attempt` admits an attempt only while the
   key's failures plus its attempts in flight are below `Threshold`.
-  `Done(true)` releases the reservation without clearing earlier
-  failures. `Succeed` does clear them; use it only where the success
-  proves the key is the caller's, such as an account name. On an IP
-  limiter, an attacker could clear its prefix by logging into its own
-  account. `IsBanned` and `BannedUntil` are read-only, for display.
+  Settle each attempt once: `Fail` counts a failure, `Release` releases
+  the reservation without clearing earlier failures, and `Succeed` also
+  clears them. Use `Succeed` only where the success proves the key is
+  the caller's, such as an account name. On an IP limiter, an attacker
+  could clear its prefix by logging into its own account. `IsBanned` and
+  `BannedUntil` are read-only, for display.
+- **Settled once.** Each reservation has an identity, so a copied
+  `Attempt` cannot settle it twice and let more than `Threshold` attempts
+  run. Keys without failures reuse counters, so attempts do not allocate.
+- **Retry-After.** `RetryAfter` of a refused attempt is the time until
+  its ban ends, in whole seconds and at least one.
 - **Counting.** Failures are counted in eight time buckets per key, which
   together cover between `Window` and 8/7 of it, so counting errs towards
   banning. Timing has nanosecond resolution on the monotonic clock.
 - **Bans.** A ban lasts `BanDuration`. If `MaxBanDuration` is longer, the
   next ban within `Cooldown` of the last one lasts twice as long, up to
-  `MaxBanDuration`.
-- **Bounded memory.** When `Capacity` pending counters are reached, the
+  `MaxBanDuration`. A `Result` tells whether a failure started a ban, for
+  logging each ban once.
+- **Bounded memory.** When `MaxPending` pending counters are reached, the
   least recently updated one is evicted. Flooding can reset pending
   counts this way, but never lifts a ban.
 - **Full ban table.** Records of ended bans are dropped first. When all
@@ -177,19 +218,26 @@ user.Done(ok)
     while legitimate users are unaffected.
 
   A key that reaches `Threshold` during a lockdown is reported banned and
-  gets its ban as soon as a record is free. `Stats` reports evictions,
-  lockdowns and waiting keys.
+  gets its ban as soon as a record is free.
+- **Persistence and manual bans.** `Bans` lists the active bans; `Ban`
+  bans a key until a given time, for an administrator or to restore the
+  saved list after a restart. Pending failures and the offences of ended
+  bans are not saved.
 - **Deterministic cleanup.** Cleanup is done by the calls that change a
   shard, plus an optional `Sweep`. Nothing runs at random or in the
   background, and every per-key operation takes amortised constant time.
-- **Observability.** `Bans` lists the active bans, `Failures` returns a
-  key's count, `Stats` returns sizes. `Unban` and `Reset` are for
-  administrators.
+- **Observability.** `Stats` returns sizes (pending, banned, cooling,
+  waiting, locked shards) and counters (failures, bans started, attempts
+  refused, bans evicted). `Failures` returns a key's count. `Unban` and
+  `Reset` are for administrators.
 
 Key IPv6 clients by prefix (`/64` or `/56`), not by single address: a
 single host may hold billions of addresses. A single `/48` holds 65536
-`/64`s, so put a limiter keyed by a wider prefix in front of the `/64`
-one to keep one network from filling the ban table.
+`/64`s, so put a limiter keyed by a wider prefix, such as
+`PrefixLen{V4: 24, V6: 48}`, in front of the `/64` one to keep one network
+from filling the ban table. A `PrefixLen` field left at zero means the
+full address, never `/0`. Behind a reverse proxy, key on
+`webguard.Guard.ClientAddr` rather than `RemoteAddr`.
 
 ## otp
 
@@ -201,7 +249,7 @@ uri, err := key.URI() // otpauth://totp/Example:alice?secret=...; render as a QR
 // At login:
 next, err := key.Verify(code, time.Now(), account.NextStep)
 if err != nil {
-	log.Print(err)                // otp.ErrCodeMismatch, ErrCodeReused, ErrCodeFormat
+	log.Print(err)                // otp.ErrCodeMismatch, ErrCodeReused, ErrStepAhead, ...
 	return errInvalidCode         // the same answer for every rejection
 }
 account.NextStep = next // persist atomically (compare-and-swap)
@@ -213,6 +261,12 @@ account.NextStep = next // persist atomically (compare-and-swap)
   `ErrCodeReused`. The value lives in the caller's account store, so
   several instances share it. `VerifyCounter` does the same for HOTP and
   resynchronises within `Skew` counters.
+- **Recovery.** If the stored step lies beyond what the clock allows,
+  because the server clock was once ahead or the state came from
+  elsewhere, every correct code would be refused until the clock catches
+  up. `Verify` reports that case as `ErrStepAhead`. Once the user has
+  proved their identity another way, reset the stored step to
+  `key.Step(now)`.
 - **Guessing.** A six-digit code is guessed with probability 2·Skew+1 in a
   million per try. Limit tries per account and per client with
   `failban`, and answer every rejected code alike: telling
@@ -227,7 +281,8 @@ account.NextStep = next // persist atomically (compare-and-swap)
   sign, no spaces. `DecodeSecret` accepts lower case and missing padding
   but nothing else. `ParseURI` rejects repeated or contradictory
   parameters.
-- Codes are compared in constant time.
+- Codes are compared in constant time, and verification does not
+  allocate.
 
 ## webguard
 
@@ -244,8 +299,10 @@ token, err := csrf.Token(sessionID(r)) // hidden field "csrf_token" or header X-
 
 `Guard` checks each request in this order:
 
-1. **Peer.** With `LoopbackPeers`, the client must be a loopback address,
-   which protects a server bound to all interfaces by mistake.
+1. **Peer.** With `LoopbackPeers`, the client may be a loopback address,
+   which protects a server bound to all interfaces by mistake; `Peers`
+   lists further allowed networks, such as a VPN's. With either set,
+   other clients are rejected.
 2. **Host allowlist.** The Host header must be one of `Hosts` (an exact
    name or IP, with or without a port), or a loopback name with
    `LoopbackHosts`. This stops DNS rebinding: a malicious site whose name
@@ -255,6 +312,34 @@ token, err := csrf.Token(sessionID(r)) // hidden field "csrf_token" or header X-
    checked first, the Origin fallback is safe. `TrustedOrigins` admits
    named origins. With `RequireOrigin`, requests that carry neither
    header must have a same-origin Referer.
+
+**Behind a reverse proxy**, `RemoteAddr` is the proxy. List the proxies in
+`TrustedProxies`: `ClientAddr` then reads the client's address from
+`ForwardedHeader` (`X-Forwarded-For` by default, or the `for` parameters of
+an RFC 7239 `Forwarded` header), skipping trusted proxies from the right,
+so that addresses a client prepends are never believed. Every trusted host
+can claim any client address: list the proxies' own addresses, not their
+network. A request from a trusted proxy that names no client, such as one
+whose header is missing or misnamed, is rejected rather than attributed to
+the proxy.
+`Peers` apply to that address, and per-client limits should key on it.
+Have the proxy pass the original `Host` on and list the public names in
+`Hosts`:
+
+```go
+g, err := webguard.New(webguard.Config{
+	Hosts:           []string{"admin.example.com"},
+	TrustedProxies:  []string{"10.0.0.2", "10.0.0.3"},
+	Peers:           []string{"192.0.2.0/24"}, // optional: the office network
+	RequireOrigin:   true,
+	SecurityHeaders: true,
+})
+addr, err := g.ClientAddr(r)
+```
+
+A `Hosts` entry with a port matches only a `Host` header with that port.
+Browsers leave out the default port (80, 443), so list the bare name for
+a server on a default port.
 
 `SecurityHeaders` adds `nosniff`, framing denial (`X-Frame-Options` and
 CSP `frame-ancestors`), `Referrer-Policy: same-origin` and COOP.
@@ -267,8 +352,10 @@ issue time, so tokens differ per response, which resists compression
 side channels, and expire after `MaxAge` (millisecond precision). The
 handler reads the token from the `X-CSRF-Token` header or a URL-encoded
 form field. It parses multipart bodies only with `MultipartForms`,
-because parsing reads the whole body before the token is checked. On browsers since 2023 the
-cross-origin check alone already stops CSRF; tokens add defence in depth.
+because parsing reads the whole body before the token is checked. On
+browsers since 2023 the cross-origin check alone already stops CSRF;
+tokens add defence in depth. `PreviousKeys` keeps tokens signed with an
+old key valid while the key is rotated.
 
 Cookie guidance: `HttpOnly`, `SameSite=Lax` or `Strict`, and over HTTPS
 `Secure` with the `__Host-` prefix. SameSite does not separate sibling
@@ -288,20 +375,20 @@ subdomains, which count as the same site; the cross-origin check does.
   `Store`.
 - `failban`: flooding with new keys can reset other keys' pending
   counters and reservations, never their bans. This bounds an attacker
-  to `Threshold` extra attempts per key for each `Capacity` keys
+  to `Threshold` extra attempts per key for each `MaxPending` keys
   flooded. A full ban table locks the shard for everyone (`LockShard`,
   the default) or ends the soonest-ending bans early (`EvictSoonest`, for
   IP-prefix keys). Size `MaxBans` for the attack you expect, and key by
-  prefix. Call `Done` exactly once per `Attempt`: a reservation that is
-  never done keeps counting against its key.
+  prefix. Settle every `Attempt`: a reservation that is never settled
+  keeps counting against its key.
 - `otp`: storing `next` without a compare-and-swap lets two concurrent
   logins with the same code both succeed. OTP does not protect against
   real-time phishing that relays the code.
 - `webguard` does not authenticate users. It does not stop other local
   processes, which can connect to loopback directly. It trusts `Host` and
-  `RemoteAddr` as `net/http` reports them: behind a reverse proxy, list
-  the public names and leave `LoopbackPeers` off. Bodies parsed for the
-  CSRF form field should be limited with `http.MaxBytesReader`.
+  `RemoteAddr` as `net/http` reports them, and the forwarded header only
+  from `TrustedProxies`. Bodies parsed for the CSRF form field should be
+  limited with `http.MaxBytesReader`.
 
 ## License
 

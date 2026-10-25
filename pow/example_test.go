@@ -15,9 +15,8 @@ func Example() {
 		panic(err)
 	}
 	// Bind the challenge to what it protects, such as the client's IP
-	// address and the form.
-	binding := []byte("198.51.100.4|login")
-	token, err := c.Issue(binding)
+	// address and the operation.
+	token, err := c.Issue("198.51.100.4", "login")
 	if err != nil {
 		panic(err)
 	}
@@ -28,8 +27,8 @@ func Example() {
 		panic(err)
 	}
 
-	fmt.Println(c.Verify(token, solution, binding))
-	fmt.Println(c.Verify(token, solution, binding))
+	fmt.Println(c.Verify(token, solution, "198.51.100.4", "login"))
+	fmt.Println(c.Verify(token, solution, "198.51.100.4", "login"))
 	// Output:
 	// <nil>
 	// pow: challenge already used

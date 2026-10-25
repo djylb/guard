@@ -2,7 +2,14 @@ package otp
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash"
 	"strings"
 	"testing"
 	"time"
@@ -431,5 +438,82 @@ func BenchmarkCode(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_, _ = k.Code(at)
+	}
+}
+
+// TestGeneratorMatchesHMAC checks the stack HMAC against crypto/hmac,
+// including secrets longer than the hash's block size.
+func TestGeneratorMatchesHMAC(t *testing.T) {
+	news := map[Algorithm]func() hash.Hash{SHA1: sha1.New, SHA256: sha256.New, SHA512: sha512.New}
+	for alg, newHash := range news {
+		for _, size := range []int{16, 20, 63, 64, 65, 127, 128, 129, 300} {
+			secret := bytes.Repeat([]byte{byte(size), 0xa5}, size)[:size]
+			k := &Key{Secret: secret, Algorithm: alg, Digits: 8}
+			for _, c := range []uint64{0, 1, 1 << 40} {
+				m := hmac.New(newHash, secret)
+				m.Write(binary.BigEndian.AppendUint64(nil, c))
+				sum := m.Sum(nil)
+				off := sum[len(sum)-1] & 0x0f
+				want := fmt.Sprintf("%08d", (binary.BigEndian.Uint32(sum[off:])&0x7fffffff)%100_000_000)
+				if got, err := k.CounterCode(c); err != nil || got != want {
+					t.Errorf("%v secret %d counter %d: %q, %v, want %q", alg, size, c, got, err, want)
+				}
+			}
+		}
+	}
+}
+
+// TestStepAhead is a regression test: a stored step beyond the clock's
+// window is reported as such, not as an ordinary reuse.
+func TestStepAhead(t *testing.T) {
+	k := &Key{Secret: rfcSHA1, Skew: 1}
+	at := time.Unix(1_700_000_000, 0)
+	cur, _ := k.Step(at)
+	code, _ := k.Code(at)
+	// A login at the top of the window leaves next at cur+2: ordinary.
+	if _, err := k.Verify(code, at, cur+2); !errors.Is(err, ErrCodeReused) {
+		t.Fatalf("next at the window's end: %v", err)
+	}
+	if _, err := k.Verify(code, at, cur+3); !errors.Is(err, ErrStepAhead) {
+		t.Fatalf("next beyond the window: %v", err)
+	}
+	// A wrong code reveals nothing about the stored step.
+	wrong := "000000"
+	if wrong == code {
+		wrong = "000001"
+	}
+	if _, err := k.Verify(wrong, at, cur+100); !errors.Is(err, ErrCodeMismatch) {
+		t.Fatalf("wrong code with next ahead: %v", err)
+	}
+	// After recovery, the code is accepted once more.
+	if next, err := k.Verify(code, at, cur); err != nil || next != cur+1 {
+		t.Fatalf("after reset: %d, %v", next, err)
+	}
+}
+
+func TestVerifyAllocs(t *testing.T) {
+	k := &Key{Secret: rfcSHA1, Algorithm: SHA512, Skew: 2}
+	at := time.Unix(1_700_000_000, 0)
+	code, _ := k.Code(at)
+	if n := testing.AllocsPerRun(100, func() {
+		if _, err := k.Verify(code, at, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := k.VerifyCounter(code, 0); err == nil {
+			t.Fatal("counter code accepted")
+		}
+	}); n != 0 {
+		t.Fatalf("Verify allocates %v times", n)
+	}
+}
+
+func TestParseAlgorithm(t *testing.T) {
+	for _, a := range []Algorithm{SHA1, SHA256, SHA512} {
+		if b, err := ParseAlgorithm(strings.ToLower(a.String())); err != nil || b != a {
+			t.Errorf("ParseAlgorithm(%v) = %v, %v", a, b, err)
+		}
+	}
+	if _, err := ParseAlgorithm("MD5"); !errors.Is(err, ErrInvalidKey) {
+		t.Error(err)
 	}
 }

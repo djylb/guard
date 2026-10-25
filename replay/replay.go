@@ -51,10 +51,12 @@ import (
 	"fmt"
 	"hash/maphash"
 	"math"
-	"math/bits"
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/djylb/guard/internal/conf"
+	"github.com/djylb/guard/internal/num"
 )
 
 // Errors returned by Check and CheckString. The rejections are distinct so
@@ -105,10 +107,18 @@ func (p FullPolicy) String() string {
 	}
 }
 
-// Default values used for zero Config fields.
-const (
-	DefaultCapacity = 1 << 16
-)
+// ParseFullPolicy returns the policy whose String form is s, ignoring
+// case.
+func ParseFullPolicy(s string) (FullPolicy, error) {
+	i, ok := conf.ParseName(s, ShrinkWindow.String(), RejectNew.String())
+	if !ok {
+		return 0, fmt.Errorf("%w: unknown full policy %q", ErrInvalidConfig, s)
+	}
+	return FullPolicy(i), nil
+}
+
+// DefaultCapacity is the capacity of a Config with zero Capacity.
+const DefaultCapacity = 1 << 16
 
 // initialShardSize is the number of entries a shard starts with.
 const initialShardSize = 16
@@ -138,6 +148,48 @@ type Config struct {
 	Full FullPolicy
 }
 
+// UnmarshalJSON reads a Config from a JSON object such as
+//
+//	{"window": "30s", "skew": "5s", "capacity": 4096, "full": "RejectNew"}
+//
+// with the fields window, skew, capacity, shards and full. Durations are
+// strings in the form of time.ParseDuration; policies are names as their
+// String method returns them. Fields that are absent keep their value;
+// unknown fields are an error. Now cannot be set from JSON.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	v := struct {
+		Full     conf.Enum[FullPolicy] `json:"full"`
+		Window   conf.Duration         `json:"window"`
+		Skew     conf.Duration         `json:"skew"`
+		Capacity int                   `json:"capacity"`
+		Shards   int                   `json:"shards"`
+	}{
+		Full:     conf.Enum[FullPolicy]{Parse: ParseFullPolicy, Value: c.Full},
+		Window:   conf.Duration(c.Window),
+		Skew:     conf.Duration(c.Skew),
+		Capacity: c.Capacity,
+		Shards:   c.Shards,
+	}
+	if err := conf.Decode(data, &v); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	c.Full, c.Window, c.Skew = v.Full.Value, time.Duration(v.Window), time.Duration(v.Skew)
+	c.Capacity, c.Shards = v.Capacity, v.Shards
+	return nil
+}
+
+// Stats is a snapshot of a Window's use.
+type Stats struct {
+	// Len is the number of nonces remembered, including those whose
+	// retention ended but that no check has forgotten yet.
+	Len int
+	// Capacity is the number of nonces the Window can remember.
+	Capacity int
+	// Evicted is the number of nonces ShrinkWindow forgot early to make
+	// room since New. If it grows, Capacity is too small for the load.
+	Evicted uint64
+}
+
 // Window remembers accepted nonces. It is safe for concurrent use. Its
 // zero value is not usable: create one with New.
 type Window struct {
@@ -162,14 +214,15 @@ type entry struct {
 }
 
 type shard struct {
-	seen  map[key]struct{}
-	ring  []entry // accepted nonces in acceptance order; grows up to limit
-	head  int
-	n     int
-	limit int
-	floor int64 // timestamps at or below are stale
-	mu    sync.Mutex
-	_     [64]byte // keeps neighbouring shards' locks off one cache line
+	seen    map[key]struct{}
+	ring    []entry // accepted nonces in acceptance order; grows up to limit
+	head    int
+	n       int
+	limit   int
+	floor   int64 // timestamps at or below are stale
+	evicted uint64
+	mu      sync.Mutex
+	_       [64]byte // keeps neighbouring shards' locks off one cache line
 }
 
 // New returns a Window configured by c.
@@ -192,14 +245,7 @@ func New(c Config) (*Window, error) {
 	if capacity == 0 {
 		capacity = DefaultCapacity
 	}
-	n := c.Shards
-	if n == 0 {
-		n = 4 * runtime.GOMAXPROCS(0)
-	}
-	n = ceilPow2(min(n, capacity))
-	for n > 1 && n > capacity {
-		n >>= 1
-	}
+	n := num.Shards(c.Shards, capacity, runtime.GOMAXPROCS(0))
 	per := (capacity + n - 1) / n
 	now := c.Now
 	if now == nil {
@@ -214,7 +260,7 @@ func New(c Config) (*Window, error) {
 		seeds:  [2]maphash.Seed{maphash.MakeSeed(), maphash.MakeSeed()},
 		window: c.Window,
 		skew:   c.Skew,
-		retain: satAdd(int64(c.Window), int64(c.Skew)),
+		retain: num.SatAdd(int64(c.Window), int64(c.Skew)),
 		mask:   uint64(n - 1),
 		full:   c.Full,
 	}
@@ -288,6 +334,7 @@ func (w *Window) check(ts time.Time, k key) error {
 				return ErrStale
 			}
 			s.pop()
+			s.evicted++
 		case RejectNew:
 			return ErrFull
 		}
@@ -296,7 +343,7 @@ func (w *Window) check(ts time.Time, k key) error {
 	if i >= len(s.ring) {
 		i -= len(s.ring)
 	}
-	s.ring[i] = entry{key: k, ts: tsOff, forget: satAdd(mono, w.retain)}
+	s.ring[i] = entry{key: k, ts: tsOff, forget: num.SatAdd(mono, w.retain)}
 	s.n++
 	s.seen[k] = struct{}{}
 	return nil
@@ -330,43 +377,20 @@ func (s *shard) pop() {
 	s.n--
 }
 
-// Len returns the number of nonces currently remembered, including those
-// whose retention ended but that no check has forgotten yet.
-func (w *Window) Len() int {
+// Stats returns a snapshot of the Window's use. The zero Window reports
+// zero Stats.
+func (w *Window) Stats() Stats {
+	var st Stats
 	if w == nil {
-		return 0
+		return st
 	}
-	total := 0
 	for i := range w.shards {
 		s := &w.shards[i]
 		s.mu.Lock()
-		total += s.n
+		st.Len += s.n
+		st.Capacity += s.limit
+		st.Evicted += s.evicted
 		s.mu.Unlock()
 	}
-	return total
-}
-
-// Capacity returns the number of nonces the Window can remember.
-func (w *Window) Capacity() int {
-	if w == nil || w.shards == nil {
-		return 0
-	}
-	return len(w.shards) * w.shards[0].limit
-}
-
-func satAdd(a, b int64) int64 {
-	if b > 0 && a > math.MaxInt64-b {
-		return math.MaxInt64
-	}
-	if b < 0 && a < math.MinInt64-b {
-		return math.MinInt64
-	}
-	return a + b
-}
-
-func ceilPow2(n int) int {
-	if n <= 1 {
-		return 1
-	}
-	return 1 << bits.Len(uint(n-1))
+	return st
 }

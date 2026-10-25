@@ -11,21 +11,28 @@ import (
 )
 
 func TestZeroValues(t *testing.T) {
-	var g Guard
-	var nilG *Guard
-	for _, h := range []http.Handler{g.Handler(okHandler), nilG.Handler(okHandler), g.Handler(nil)} {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://localhost/", nil))
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("zero Guard: %d", rec.Code)
+	// A nil and a zero Guard and CSRF all fail closed.
+	for _, g := range []*Guard{nil, new(Guard)} {
+		for _, h := range []http.Handler{g.Handler(okHandler), g.Handler(nil)} {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://localhost/", nil))
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("zero Guard: %d", rec.Code)
+			}
+		}
+		r := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+		if err := g.Check(r); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
+		}
+		if _, err := g.ClientAddr(r); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
 		}
 	}
-	if err := g.Check(httptest.NewRequest(http.MethodGet, "http://localhost/", nil)); !errors.Is(err, ErrUninitialized) {
-		t.Error(err)
-	}
-	var x CSRF
-	var nilX *CSRF
-	for _, h := range []http.Handler{x.Handler(func(*http.Request) string { return "s" }, okHandler), nilX.Handler(nil, okHandler)} {
+	for _, x := range []*CSRF{nil, new(CSRF)} {
+		h := x.Handler(func(*http.Request) string { return "s" }, okHandler)
+		if _, err := x.Token("s"); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
+		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://localhost/", nil))
 		if rec.Code != http.StatusForbidden {

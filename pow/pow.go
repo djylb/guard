@@ -12,9 +12,12 @@
 // remembers the nonces of the challenges it accepted until they expire.
 //
 //	c, err := pow.New(pow.Config{Key: key, Difficulty: 18})
-//	token, err := c.Issue(binding)               // server, sent to the client
-//	solution, err := pow.Solve(ctx, token)       // client
-//	err = c.Verify(token, solution, binding)     // server
+//	token, err := c.Issue(clientIP, "login")          // server, sent to the client
+//	solution, err := pow.Solve(ctx, token)            // client
+//	err = c.Verify(token, solution, clientIP, "login") // server
+//
+// The binding is a list of strings, each length-prefixed in the MAC, so
+// that ("ab", "c") and ("a", "bc") are different bindings.
 //
 // # Token and puzzle
 //
@@ -24,7 +27,8 @@
 //	version (1, currently 1) | difficulty (1) | expiry (8, Unix milliseconds, big-endian)
 //	| nonce (16) | HMAC-SHA-256 (32)
 //
-// The MAC covers the first 26 bytes and the binding. A solution is a 64-bit
+// The MAC covers a domain string, the first 26 bytes and the binding
+// fields, each preceded by its length as a uvarint. A solution is a 64-bit
 // number s such that SHA-256(token bytes || s as 8 big-endian bytes) starts
 // with at least difficulty zero bits. Each extra bit doubles the expected
 // work: difficulty d takes 2^d hashes on average.
@@ -38,7 +42,9 @@
 //
 // # Several servers
 //
-// Servers that share the key accept each other's challenges. Each
+// Servers that share the key accept each other's challenges. To rotate
+// the key, make the new one Config.Key and keep the old one in
+// PreviousKeys for one TTL. Each
 // Challenger records the challenges it accepted in a Store; the default,
 // a MemoryStore, lives in process memory, so a solved challenge could be
 // used once on each server and once more after a restart. Deployments
@@ -48,28 +54,26 @@ package pow
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"math"
 	"math/bits"
 	"runtime"
-	"sync"
 	"time"
 
+	"github.com/djylb/guard/internal/conf"
+	"github.com/djylb/guard/internal/sign"
 	"github.com/djylb/guard/replay"
 )
 
 // Version is the token format version this package issues and accepts.
 const Version = 1
 
-// Defaults used for zero Config fields.
+// Defaults of zero Config fields.
 const (
 	DefaultDifficulty     = 18
 	DefaultTTL            = 2 * time.Minute
@@ -77,7 +81,7 @@ const (
 	DefaultReplayCapacity = 1 << 16
 )
 
-// MinKeySize is the minimum length of Config.Key.
+// MinKeySize is the minimum length of Config.Key and PreviousKeys.
 const MinKeySize = 16
 
 const (
@@ -87,7 +91,7 @@ const (
 	TokenLen = (rawLen*8 + 5) / 6
 )
 
-var domain = []byte("guard/pow/v1\x00")
+const domain = "guard/pow/v1"
 
 var (
 	enc    = base64.RawURLEncoding
@@ -129,11 +133,14 @@ type Config struct {
 	// Store records accepted challenges. It defaults to a MemoryStore
 	// with ReplayCapacity entries.
 	Store Store
-	// Key is the HMAC key, at least MinKeySize bytes and not all zero.
-	// Servers that verify each other's challenges must share it. If it
-	// is nil, New generates a random key, so challenges are valid only
-	// in this process. New copies it.
+	// Key is the HMAC key that signs challenges, at least MinKeySize
+	// bytes and not all zero. Servers that verify each other's
+	// challenges must share it. If it is nil, New generates a random
+	// key, so challenges are valid only in this process. New copies it.
 	Key []byte
+	// PreviousKeys are keys that still verify but no longer sign, for
+	// rotating Key: keep the old key here for one TTL.
+	PreviousKeys [][]byte
 	// Difficulty is the number of leading zero bits Issue asks for,
 	// from 1 to 255. It defaults to DefaultDifficulty.
 	Difficulty int
@@ -151,13 +158,43 @@ type Config struct {
 	ReplayCapacity int
 }
 
+// UnmarshalJSON reads a Config from a JSON object such as
+//
+//	{"key": "base64...", "difficulty": 18, "ttl": "2m", "skew": "2s"}
+//
+// with the fields key and previous_keys (standard base64), difficulty,
+// ttl, skew and replay_capacity. Durations are strings in the form of
+// time.ParseDuration. Fields that are absent keep their value; unknown
+// fields and null values are an error. The key is required unless the
+// Config already has one; "key": "random" asks for a key generated per
+// process. Now and Store cannot be set from JSON.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	v := struct {
+		Key            conf.Key      `json:"key"`
+		PreviousKeys   [][]byte      `json:"previous_keys"`
+		TTL            conf.Duration `json:"ttl"`
+		Skew           conf.Duration `json:"skew"`
+		Difficulty     int           `json:"difficulty"`
+		ReplayCapacity int           `json:"replay_capacity"`
+	}{conf.Key{}, c.PreviousKeys, conf.Duration(c.TTL), conf.Duration(c.Skew), c.Difficulty, c.ReplayCapacity}
+	if err := conf.Decode(data, &v); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	key, err := v.Key.Resolve(c.Key)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	c.Key, c.PreviousKeys, c.TTL, c.Skew = key, v.PreviousKeys, time.Duration(v.TTL), time.Duration(v.Skew)
+	c.Difficulty, c.ReplayCapacity = v.Difficulty, v.ReplayCapacity
+	return nil
+}
+
 // Challenger issues and verifies challenges. It is safe for concurrent
 // use. Its zero value is not usable: create one with New.
 type Challenger struct {
-	macs       sync.Pool // of *macState keyed with key
 	now        func() time.Time
 	store      Store
-	key        []byte
+	signer     *sign.Signer
 	ttl        time.Duration
 	skew       time.Duration
 	difficulty uint8
@@ -165,18 +202,9 @@ type Challenger struct {
 
 // New returns a Challenger configured by c.
 func New(c Config) (*Challenger, error) {
-	key := c.Key
-	if key == nil {
-		key = make([]byte, 32)
-		_, _ = rand.Read(key) // crypto/rand.Read never fails
-	} else {
-		if len(key) < MinKeySize {
-			return nil, fmt.Errorf("%w: key shorter than %d bytes", ErrInvalidConfig, MinKeySize)
-		}
-		if allZero(key) {
-			return nil, fmt.Errorf("%w: all-zero key", ErrInvalidConfig)
-		}
-		key = append([]byte(nil), key...)
+	signer, err := sign.New(domain, c.Key, c.PreviousKeys, MinKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	difficulty := c.Difficulty
 	if difficulty == 0 {
@@ -211,6 +239,10 @@ func New(c Config) (*Challenger, error) {
 		now = time.Now
 	}
 	store := c.Store
+	if m, ok := store.(*MemoryStore); ok && m != nil && ttl+skew > m.window+m.skew {
+		return nil, fmt.Errorf("%w: TTL %v plus skew %v exceeds the MemoryStore's window %v plus skew %v",
+			ErrInvalidConfig, ttl, skew, m.window, m.skew)
+	}
 	if store == nil {
 		m, err := NewMemoryStore(replay.Config{Now: now, Window: ttl, Skew: skew, Capacity: capacity})
 		if err != nil {
@@ -218,9 +250,7 @@ func New(c Config) (*Challenger, error) {
 		}
 		store = m
 	}
-	c2 := &Challenger{now: now, store: store, key: key, ttl: ttl, skew: skew, difficulty: uint8(difficulty)}
-	c2.macs.New = func() any { return &macState{h: hmac.New(sha256.New, key)} }
-	return c2, nil
+	return &Challenger{now: now, store: store, signer: signer, ttl: ttl, skew: skew, difficulty: uint8(difficulty)}, nil
 }
 
 func checkDifficulty(d int) error {
@@ -231,70 +261,49 @@ func checkDifficulty(d int) error {
 }
 
 // Issue returns a new challenge at the configured difficulty, bound to
-// binding. Verify accepts it only with the same binding.
-//
-// Encode a binding of several fields unambiguously, with length prefixes
-// or a separator that cannot occur in the fields: joined as plain strings,
-// "ab"+"c" and "a"+"bc" would be the same binding.
-func (c *Challenger) Issue(binding []byte) (string, error) {
-	if c == nil || c.key == nil {
+// the binding fields, such as the client's IP address and the operation.
+// Verify accepts it only with the same fields in the same order.
+func (c *Challenger) Issue(binding ...string) (string, error) {
+	if c == nil || c.signer == nil {
 		return "", ErrUninitialized
 	}
-	return c.issue(binding, c.difficulty), nil
+	return c.issue(c.difficulty, binding), nil
 }
 
 // IssueDifficulty is Issue with a difficulty for this challenge, from 1
 // to 255, for servers that raise the cost while under attack.
-func (c *Challenger) IssueDifficulty(binding []byte, difficulty int) (string, error) {
-	if c == nil || c.key == nil {
+func (c *Challenger) IssueDifficulty(difficulty int, binding ...string) (string, error) {
+	if c == nil || c.signer == nil {
 		return "", ErrUninitialized
 	}
 	if err := checkDifficulty(difficulty); err != nil {
 		return "", err
 	}
-	return c.issue(binding, uint8(difficulty)), nil
+	return c.issue(uint8(difficulty), binding), nil
 }
 
-func (c *Challenger) issue(binding []byte, difficulty uint8) string {
+func (c *Challenger) issue(difficulty uint8, binding []string) string {
 	var raw [rawLen]byte
 	raw[0] = Version
 	raw[1] = difficulty
 	binary.BigEndian.PutUint64(raw[2:10], uint64(c.now().Add(c.ttl).UnixMilli()))
 	_, _ = rand.Read(raw[10:headerLen]) // crypto/rand.Read never fails
-	mac := c.sign([headerLen]byte(raw[:headerLen]), binding)
+	mac := c.signer.Sign(raw[:headerLen], binding...)
 	copy(raw[headerLen:], mac[:])
 	return enc.EncodeToString(raw[:])
 }
 
-// macState is a pooled HMAC with buffers that outlive the call, so that
-// nothing passed to the hash escapes from the caller's stack.
-type macState struct {
-	h      hash.Hash
-	header [headerLen]byte
-	sum    [sha256.Size]byte
-}
-
-// sign returns the MAC of header and binding.
-func (c *Challenger) sign(header [headerLen]byte, binding []byte) [sha256.Size]byte {
-	st, _ := c.macs.Get().(*macState)
-	st.header = header
-	st.h.Reset()
-	st.h.Write(domain)
-	st.h.Write(st.header[:])
-	st.h.Write(binding)
-	st.h.Sum(st.sum[:0])
-	mac := st.sum
-	c.macs.Put(st)
-	return mac
-}
-
 // Verify checks that solution solves token, that the challenge was issued
-// by this Challenger's key for binding and has not expired, and that it
-// was not accepted before. It returns nil and remembers the challenge if
-// all hold. A challenge rejected for any reason is not remembered, so a
-// client may retry it with a correct solution.
-func (c *Challenger) Verify(token string, solution uint64, binding []byte) error {
-	if c == nil || c.key == nil {
+// with this Challenger's key, or one of its previous keys, for the
+// binding fields and has not expired, and that it was not accepted
+// before. It returns nil and remembers the challenge if all hold. A
+// challenge rejected for any reason is not remembered, so a client may
+// retry it with a correct solution.
+//
+// The errors are distinct for logs and metrics; answer the client alike
+// for all of them, apart from asking for a new challenge.
+func (c *Challenger) Verify(token string, solution uint64, binding ...string) error {
+	if c == nil || c.signer == nil {
 		return ErrUninitialized
 	}
 	raw, ch, err := decode(token)
@@ -315,8 +324,7 @@ func (c *Challenger) Verify(token string, solution uint64, binding []byte) error
 	if !meets(&raw, solution, ch.Difficulty) {
 		return ErrInsufficientWork
 	}
-	mac := c.sign([headerLen]byte(raw[:headerLen]), binding)
-	if subtle.ConstantTimeCompare(mac[:], raw[headerLen:]) != 1 {
+	if !c.signer.Verify(raw[headerLen:], raw[:headerLen], binding...) {
 		return ErrInvalidSignature
 	}
 	fresh, err := c.store.MarkUsed(ch.Nonce, ch.Expires)
@@ -361,17 +369,25 @@ type Store interface {
 type MemoryStore struct {
 	w      *replay.Window
 	window time.Duration
+	skew   time.Duration
 }
 
 // NewMemoryStore returns a MemoryStore configured by c, where c.Window is
 // the TTL of the challenges it records and c.Skew how far ahead their
-// issuers' clocks may run.
+// issuers' clocks may run. Challengers with different TTLs may share it as
+// long as TTL plus Skew of each is at most c.Window plus c.Skew; New
+// rejects a Challenger that exceeds it.
 func NewMemoryStore(c replay.Config) (*MemoryStore, error) {
 	w, err := replay.New(c)
 	if err != nil {
 		return nil, err
 	}
-	return &MemoryStore{w: w, window: c.Window}, nil
+	return &MemoryStore{w: w, window: c.Window, skew: c.Skew}, nil
+}
+
+// Stats returns the use of the store's replay window.
+func (m *MemoryStore) Stats() replay.Stats {
+	return m.w.Stats()
 }
 
 // MarkUsed implements Store. When the window is full, it reports the
@@ -503,12 +519,4 @@ func leadingZeros(sum *[sha256.Size]byte) int {
 		n += 64
 	}
 	return n
-}
-
-func allZero(b []byte) bool {
-	var acc byte
-	for _, x := range b {
-		acc |= x
-	}
-	return acc == 0
 }

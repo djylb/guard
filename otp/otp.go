@@ -24,6 +24,16 @@
 // same for HOTP counters. There is deliberately no check that ignores
 // replays.
 //
+// # Recovery
+//
+// If the stored step lies beyond what the clock allows, because the
+// server's clock was once ahead and has been corrected, or the state was
+// restored from elsewhere, every correct code is refused until the clock
+// catches up. Verify reports this case as ErrStepAhead rather than
+// ErrCodeReused, so that the service can log it and, once the user has
+// proved their identity another way, such as with a recovery code, reset
+// the stored step to Step(now).
+//
 // Codes are compared in constant time, and Verify accepts only codes of
 // exactly Digits ASCII digits.
 //
@@ -37,7 +47,6 @@
 package otp
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -46,7 +55,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"math"
 	"time"
 )
@@ -62,6 +70,11 @@ var (
 	// ErrCodeReused reports a code that matches a time step that was
 	// already used: a replay, or a second login within one period.
 	ErrCodeReused = errors.New("otp: code already used")
+	// ErrStepAhead reports a correct code that Verify refuses because
+	// the stored next step lies beyond every step the clock allows: the
+	// clock went back, or the stored state is wrong. See Recovery in the
+	// package documentation.
+	ErrStepAhead = errors.New("otp: stored step ahead of the clock")
 	// ErrInvalidKey reports a Key whose parameters cannot be used.
 	ErrInvalidKey = errors.New("otp: invalid key")
 	// ErrInvalidSecret reports a secret that is not valid base32.
@@ -97,16 +110,46 @@ func (a Algorithm) String() string {
 	}
 }
 
-func (a Algorithm) hash() func() hash.Hash {
+// ParseAlgorithm returns the algorithm whose String form is s, ignoring
+// case.
+func ParseAlgorithm(s string) (Algorithm, error) {
+	for _, a := range [...]Algorithm{SHA1, SHA256, SHA512} {
+		if equalFold(s, a.String()) {
+			return a, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: unknown algorithm %q", ErrInvalidKey, s)
+}
+
+// sizes returns the block and digest size of the algorithm's hash, or
+// zeros for an unknown algorithm.
+func (a Algorithm) sizes() (block, digest int) {
 	switch a {
 	case SHA1:
-		return sha1.New
+		return sha1.BlockSize, sha1.Size
 	case SHA256:
-		return sha256.New
+		return sha256.BlockSize, sha256.Size
 	case SHA512:
-		return sha512.New
+		return sha512.BlockSize, sha512.Size
 	default:
-		return nil
+		return 0, 0
+	}
+}
+
+// sum hashes b into out and returns the digest.
+func (a Algorithm) sum(out *[sha512.Size]byte, b []byte) []byte {
+	switch a {
+	case SHA1:
+		d := sha1.Sum(b)
+		return out[:copy(out[:], d[:])]
+	case SHA256:
+		d := sha256.Sum256(b)
+		return out[:copy(out[:], d[:])]
+	case SHA512:
+		*out = sha512.Sum512(b)
+		return out[:]
+	default:
+		return out[:0]
 	}
 }
 
@@ -213,7 +256,7 @@ func (k *Key) params() (digits int, period uint64, err error) {
 	if len(k.Secret) < minSize {
 		return 0, 0, fmt.Errorf("%w: secret of %d bytes, need at least %d", ErrInvalidKey, len(k.Secret), minSize)
 	}
-	if k.Algorithm.hash() == nil {
+	if b, _ := k.Algorithm.sizes(); b == 0 {
 		return 0, 0, fmt.Errorf("%w: unknown %v", ErrInvalidKey, k.Algorithm)
 	}
 	digits = k.Digits
@@ -266,7 +309,8 @@ func (k *Key) Code(t time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	g := k.newGenerator(digits)
+	var g generator
+	g.init(k, digits)
 	return string(g.code(s)), nil
 }
 
@@ -276,7 +320,8 @@ func (k *Key) CounterCode(counter uint64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	g := k.newGenerator(digits)
+	var g generator
+	g.init(k, digits)
 	return string(g.code(counter)), nil
 }
 
@@ -286,7 +331,8 @@ func (k *Key) CounterCode(counter uint64) (string, error) {
 // a fresh account). On success it returns the value to store as the
 // account's next acceptable step.
 //
-// A correct code for a step below next returns ErrCodeReused. If a code
+// A correct code for a step below next returns ErrCodeReused, or
+// ErrStepAhead if next lies beyond every step the clock allows. If a code
 // matches several steps by chance, the latest acceptable one is used.
 func (k *Key) Verify(code string, t time.Time, next uint64) (uint64, error) {
 	digits, period, err := k.params()
@@ -302,7 +348,13 @@ func (k *Key) Verify(code string, t time.Time, next uint64) (uint64, error) {
 	}
 	lo := cur - min(cur, uint64(k.Skew))
 	hi := cur + min(math.MaxUint64-1-cur, uint64(k.Skew)) // cur < MaxUint64
-	return k.verify(code, digits, lo, hi, next)
+	next, err = k.verify(code, digits, lo, hi, next)
+	if errors.Is(err, ErrCodeReused) && next > hi+1 {
+		// No code at all could be accepted now: a legitimate login
+		// leaves next at most one above the window.
+		err = ErrStepAhead
+	}
+	return next, err
 }
 
 // VerifyCounter checks an HOTP code against counters next to next+Skew,
@@ -329,12 +381,12 @@ func (k *Key) VerifyCounter(code string, next uint64) (uint64, error) {
 // verify compares code with the codes of steps lo to hi, all of them, in
 // constant time per step.
 func (k *Key) verify(code string, digits int, lo, hi, next uint64) (uint64, error) {
-	g := k.newGenerator(digits)
-	want := []byte(code)
+	var g generator
+	g.init(k, digits)
 	matched, reused := false, false
 	var accept uint64
 	for s := lo; ; s++ {
-		if subtle.ConstantTimeCompare(g.code(s), want) == 1 {
+		if equalCode(g.code(s), code) {
 			if s >= next {
 				matched, accept = true, s
 			} else {
@@ -367,27 +419,76 @@ func wellFormed(code string, digits int) bool {
 	return true
 }
 
-var pow10 = [MaxDigits + 1]uint64{1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10}
-
-// generator computes codes with one reusable HMAC.
-type generator struct {
-	mac    hash.Hash
-	sum    [sha512.Size]byte
-	out    [MaxDigits]byte
-	digits int
+// equalCode compares a code with a well-formed candidate of the same
+// length in constant time.
+func equalCode(got []byte, code string) bool {
+	var v byte
+	for i := range got {
+		v |= got[i] ^ code[i]
+	}
+	return subtle.ConstantTimeByteEq(v, 0) == 1
 }
 
-func (k *Key) newGenerator(digits int) *generator {
-	return &generator{mac: hmac.New(k.Algorithm.hash(), k.Secret), digits: digits}
+// equalFold reports whether s and t are equal ignoring ASCII case.
+func equalFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if 'a' <= a && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if 'a' <= b && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+var pow10 = [MaxDigits + 1]uint64{1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10}
+
+// generator computes HMAC-based codes on the stack: an HMAC is the hash
+// of the key's outer pad and the hash of its inner pad and the message,
+// so both buffers hold their pad once and only the message and the inner
+// digest change per code.
+type generator struct {
+	inner  [sha512.BlockSize + 8]byte           // ipad || counter
+	outer  [sha512.BlockSize + sha512.Size]byte // opad || inner digest
+	sum    [sha512.Size]byte
+	out    [MaxDigits]byte
+	block  int
+	digest int
+	digits int
+	alg    Algorithm
+}
+
+// init keys g with k's secret; k's parameters were validated.
+func (g *generator) init(k *Key, digits int) {
+	g.alg, g.digits = k.Algorithm, digits
+	g.block, g.digest = k.Algorithm.sizes()
+	key := k.Secret
+	if len(key) > g.block {
+		key = g.alg.sum(&g.sum, key)
+	}
+	for i := range g.block {
+		var b byte
+		if i < len(key) {
+			b = key[i]
+		}
+		g.inner[i] = b ^ 0x36
+		g.outer[i] = b ^ 0x5c
+	}
 }
 
 // code returns the code for counter c, valid until the next call.
 func (g *generator) code(c uint64) []byte {
-	var msg [8]byte
-	binary.BigEndian.PutUint64(msg[:], c)
-	g.mac.Reset()
-	g.mac.Write(msg[:])
-	sum := g.mac.Sum(g.sum[:0])
+	binary.BigEndian.PutUint64(g.inner[g.block:], c)
+	copy(g.outer[g.block:], g.alg.sum(&g.sum, g.inner[:g.block+8]))
+	sum := g.alg.sum(&g.sum, g.outer[:g.block+g.digest])
 	off := sum[len(sum)-1] & 0x0f
 	v := uint64(binary.BigEndian.Uint32(sum[off:]) & 0x7fffffff)
 	v %= pow10[g.digits]

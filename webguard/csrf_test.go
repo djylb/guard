@@ -3,6 +3,7 @@ package webguard
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -224,7 +225,7 @@ func BenchmarkCSRFToken(b *testing.B) {
 	}
 }
 
-// authentic recomputes a token's MAC independently of CSRF.sign.
+// authentic recomputes a token's MAC independently of the signer.
 func authentic(session, token string) bool {
 	raw, err := csrfEnc.DecodeString(token)
 	if err != nil || len(raw) != csrfRawLen {
@@ -233,6 +234,51 @@ func authentic(session, token string) bool {
 	m := hmac.New(sha256.New, testKey)
 	m.Write([]byte("guard/csrf/v1\x00"))
 	m.Write(raw[:csrfHeaderLen])
+	m.Write(binary.AppendUvarint(nil, uint64(len(session))))
 	m.Write([]byte(session))
 	return hmac.Equal(m.Sum(nil), raw[csrfHeaderLen:])
+}
+
+func TestCSRFKeyRotation(t *testing.T) {
+	newKey := []byte("fedcba9876543210fedcba9876543210")
+	old := mustCSRF(t, CSRFConfig{Key: testKey})
+	rotated := mustCSRF(t, CSRFConfig{Key: newKey, PreviousKeys: [][]byte{testKey}})
+	token, _ := old.Token("s")
+	if err := rotated.Verify("s", token); err != nil {
+		t.Fatalf("previous key: %v", err)
+	}
+	if err := mustCSRF(t, CSRFConfig{Key: newKey}).Verify("s", token); !errors.Is(err, ErrCSRFToken) {
+		t.Fatalf("retired key: %v", err)
+	}
+	token, _ = rotated.Token("s")
+	if err := old.Verify("s", token); !errors.Is(err, ErrCSRFToken) {
+		t.Fatalf("rotated CSRF still signs with the old key: %v", err)
+	}
+	if err := rotated.Verify("s", token); err != nil {
+		t.Fatalf("own token with previous keys: %v", err)
+	}
+	if _, err := NewCSRF(CSRFConfig{PreviousKeys: [][]byte{testKey}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatal(err)
+	}
+}
+
+// TestCSRFAllocs checks that Verify does not allocate, also when it
+// rejects an expired or forged token.
+func TestCSRFAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool drops items in race builds")
+	}
+	clk := newFakeClock()
+	x := mustCSRF(t, CSRFConfig{Now: clk.Now, Key: testKey, MaxAge: time.Minute})
+	old, _ := x.Token("s")
+	clk.Advance(2 * time.Minute)
+	fresh, _ := x.Token("s")
+	for token, want := range map[string]error{fresh: nil, old: ErrCSRFToken, fresh[:CSRFTokenLen-1] + "A": ErrCSRFToken} {
+		if err := x.Verify("s", token); !errors.Is(err, want) && err != want {
+			t.Fatalf("Verify = %v, want %v", err, want)
+		}
+		if n := testing.AllocsPerRun(100, func() { _ = x.Verify("s", token) }); n != 0 {
+			t.Errorf("Verify (want %v) allocates %v times", want, n)
+		}
+	}
 }

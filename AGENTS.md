@@ -5,7 +5,8 @@
   (`GOOS=js GOARCH=wasm go test ./...` with `$(go env GOROOT)/lib/wasm` on
   `PATH`) must pass, and each fuzz target must survive a short run.
 - Standard library only, also for tests. Only `webguard` imports net/http;
-  register every new package in `deps_test.go`.
+  code shared by packages lives in `internal/`; register every new
+  package in `deps_test.go`.
 - No background goroutines. Memory is bounded by configuration and
   reclaimed by the calls that use it.
 - Fail closed: a zero value or an invalid configuration denies or returns
@@ -15,8 +16,15 @@
   limits use the monotonic clock.
 - Compare MACs, codes and tokens in constant time; draw secrets and nonces
   from crypto/rand.
-- Checks (replay, ban, challenge and token verification) stay
-  allocation-free.
+- Checks (replay, ban, challenge, one-time password, CSRF token and
+  Guard request checks) stay allocation-free, rejections included: use
+  preallocated errors. Document any allocation left inside the standard
+  library.
+- Every `Config` decodes from JSON: snake_case fields, durations as
+  `time.ParseDuration` strings, enums by their `String` names, unknown
+  fields rejected.
+- No `Must` constructors; one way to do each thing, the same across
+  packages.
 - Errors meant for logs may say why a check failed; the docs tell callers
   not to pass that difference on to the peer.
 - Tests must not leak goroutines or timers.

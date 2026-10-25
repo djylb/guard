@@ -14,5 +14,6 @@
 //     cross-site request forgery, with CSRF tokens.
 //
 // None of the packages starts goroutines; their memory is bounded by
-// configuration and reclaimed by the calls that use it.
+// configuration and reclaimed by the calls that use it. Every Config
+// decodes from JSON, with durations written as strings such as "15m".
 package guard

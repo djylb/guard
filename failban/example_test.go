@@ -9,66 +9,104 @@ import (
 	"github.com/djylb/guard/failban"
 )
 
-var (
+var errTooManyAttempts = errors.New("too many attempts")
+
+// A login limited per account and per client network.
+type login struct {
 	// Bans by account name keep the default LockShard policy, so that
 	// made-up names cannot push out the ban on a real account.
-	users = failban.MustNew[string](failban.Config{
+	users *failban.Limiter[string]
+	// Bans by IP prefix may end the soonest-ending ban when the table is
+	// full, rather than lock out a whole shard.
+	ips *failban.Limiter[netip.Prefix]
+}
+
+func newLogin() (*login, error) {
+	users, err := failban.New[string](failban.Config{
 		Threshold:      5,
 		Window:         15 * time.Minute,
 		BanDuration:    time.Minute,
 		MaxBanDuration: time.Hour, // repeat offenders: 1m, 2m, 4m, ... 1h
 	})
-	// Bans by IP prefix may end the soonest-ending ban when the table is
-	// full, rather than lock out a whole shard.
-	ips = failban.MustNew[netip.Prefix](failban.Config{Threshold: 20, Full: failban.EvictSoonest})
-)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := failban.New[netip.Prefix](failban.Config{Threshold: 20, Full: failban.EvictSoonest})
+	if err != nil {
+		return nil, err
+	}
+	return &login{users: users, ips: ips}, nil
+}
 
-var errTooManyAttempts = errors.New("too many attempts")
-
-func login(remoteAddr, name string, check func() bool) error {
-	prefix, err := failban.RemotePrefix(remoteAddr, failban.HostBitsV4, failban.SiteBitsV6)
+func (l *login) check(remoteAddr, name string, password func() bool) error {
+	prefix, err := failban.PrefixLen{V4: 32, V6: 64}.OfRemote(remoteAddr)
 	if err != nil {
 		return err
 	}
-	ip := ips.Attempt(prefix)
-	user := users.Attempt(name)
+	ip := l.ips.Attempt(prefix)
+	user := l.users.Attempt(name)
 	if !ip.Allowed() || !user.Allowed() {
-		ip.Done(true) // release whichever reservation was made
-		user.Done(true)
+		ip.Release() // release whichever reservation was made
+		user.Release()
+		// Over HTTP: 429 with Retry-After set to this many seconds.
+		_ = max(ip.RetryAfter(), user.RetryAfter()) / time.Second
 		return errTooManyAttempts
 	}
-	ok := check() // the slow password check runs at most Threshold times at once
-	ip.Done(ok)
-	user.Done(ok)
-	if !ok {
+	if !password() { // the slow check runs at most Threshold times at once
+		ip.Fail()
+		if r := user.Fail(); r.Started {
+			fmt.Printf("%s banned (offence %d)\n", name, r.Offences)
+		}
 		return errors.New("wrong password")
 	}
+	ip.Release()   // a success does not clear the prefix's failures
+	user.Succeed() // but proves the account is the caller's
 	return nil
 }
 
 func Example() {
-	for range 6 {
-		fmt.Println(login("198.51.100.7:4321", "alice", func() bool { return false }))
+	l, err := newLogin()
+	if err != nil {
+		panic(err)
 	}
-	fmt.Println(users.IsBanned("alice"), users.IsBanned("bob"))
+	for range 6 {
+		fmt.Println(l.check("198.51.100.7:4321", "alice", func() bool { return false }))
+	}
+	fmt.Println(l.users.IsBanned("alice"), l.users.IsBanned("bob"))
 	// Output:
 	// wrong password
 	// wrong password
 	// wrong password
 	// wrong password
+	// alice banned (offence 1)
 	// wrong password
 	// too many attempts
 	// true false
 }
 
-func ExampleRemotePrefix() {
-	l := failban.MustNew[netip.Prefix](failban.Config{Threshold: 10})
+func ExamplePrefixLen() {
 	// Key IPv4 clients by address and IPv6 clients by /64.
-	p, err := failban.RemotePrefix("[2001:db8::7]:51234", failban.HostBitsV4, failban.SiteBitsV6)
+	host := failban.PrefixLen{V4: 32, V6: 64}
+	p, err := host.OfRemote("[2001:db8::7]:51234")
 	if err != nil {
 		panic(err)
 	}
-	l.Fail(p)
-	fmt.Println(p, l.Failures(p))
-	// Output: 2001:db8::/64 1
+	fmt.Println(p)
+	// Output: 2001:db8::/64
+}
+
+func ExampleLimiter_Ban() {
+	l, err := failban.New[string](failban.Config{})
+	if err != nil {
+		panic(err)
+	}
+	// Restore bans saved with Bans before a restart, or ban by hand.
+	saved := []failban.Ban[string]{{Key: "mallory", Until: time.Now().Add(time.Hour), Offences: 3}}
+	for _, b := range saved {
+		if err := l.Ban(b); err != nil {
+			fmt.Println(err)
+		}
+	}
+	fmt.Println(l.IsBanned("mallory"))
+	// Output: true
 }

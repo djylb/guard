@@ -9,8 +9,8 @@ import (
 )
 
 // TestPackageDependencies checks what the README promises: every package
-// depends on the standard library alone, apart from pow on replay, and
-// only webguard links net/http.
+// depends on the standard library alone, apart from pow on replay and
+// shared internal helpers, and only webguard links net/http.
 func TestPackageDependencies(t *testing.T) {
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("cannot run the go command")
@@ -20,13 +20,17 @@ func TestPackageDependencies(t *testing.T) {
 		t.Skip("no go command")
 	}
 	const module = "github.com/djylb/guard"
+	conf, num, sign := module+"/internal/conf", module+"/internal/num", module+"/internal/sign"
 	allowed := map[string][]string{
 		module:               nil,
-		module + "/replay":   nil,
-		module + "/pow":      {module + "/replay"},
-		module + "/failban":  nil,
+		conf:                 nil,
+		num:                  nil,
+		sign:                 nil,
+		module + "/replay":   {conf, num},
+		module + "/pow":      {module + "/replay", conf, num, sign},
+		module + "/failban":  {conf, num},
 		module + "/otp":      nil,
-		module + "/webguard": nil,
+		module + "/webguard": {conf, sign},
 	}
 	listed, err := exec.Command(goCmd, "list", module+"/...").Output()
 	if err != nil {

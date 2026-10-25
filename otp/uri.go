@@ -212,14 +212,7 @@ func ParseURI(uri string) (*Key, error) {
 	if v, ok, err := get("algorithm"); err != nil {
 		return nil, err
 	} else if ok {
-		switch strings.ToUpper(v) {
-		case "SHA1":
-			k.Algorithm = SHA1
-		case "SHA256":
-			k.Algorithm = SHA256
-		case "SHA512":
-			k.Algorithm = SHA512
-		default:
+		if k.Algorithm, err = ParseAlgorithm(v); err != nil {
 			return nil, fmt.Errorf("%w: algorithm %q", ErrInvalidURI, v)
 		}
 	}

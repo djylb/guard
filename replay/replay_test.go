@@ -2,6 +2,7 @@ package replay
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math"
 	"runtime"
@@ -117,7 +118,7 @@ func TestExpiry(t *testing.T) {
 		}
 		clk.Advance(30 * time.Second)
 	}
-	if n := w.Len(); n > 4 {
+	if n := w.Stats().Len; n > 4 {
 		t.Fatalf("Len = %d, capacity 4", n)
 	}
 }
@@ -235,9 +236,9 @@ func TestConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		w := mustNew(t, Config{Window: time.Second, Capacity: tt.capacity, Shards: tt.shards})
-		if w.Capacity() != tt.wantCap || len(w.shards) != tt.wantShards {
+		if c := w.Stats().Capacity; c != tt.wantCap || len(w.shards) != tt.wantShards {
 			t.Errorf("capacity %d shards %d: got %d/%d, want %d/%d", tt.capacity, tt.shards,
-				w.Capacity(), len(w.shards), tt.wantCap, tt.wantShards)
+				c, len(w.shards), tt.wantCap, tt.wantShards)
 		}
 	}
 	if FullPolicy(7).String() != "FullPolicy(7)" {
@@ -246,16 +247,17 @@ func TestConfig(t *testing.T) {
 }
 
 func TestUninitialized(t *testing.T) {
-	var w *Window
-	if err := w.Check(time.Now(), []byte("n")); !errors.Is(err, ErrUninitialized) {
-		t.Error(err)
-	}
-	var z Window
-	if err := z.CheckString(time.Now(), "n"); !errors.Is(err, ErrUninitialized) {
-		t.Error(err)
-	}
-	if w.Len() != 0 || z.Len() != 0 || z.Capacity() != 0 {
-		t.Error("nil or zero window reports entries")
+	// A nil and a zero Window both fail closed.
+	for _, w := range []*Window{nil, new(Window)} {
+		if err := w.Check(time.Now(), []byte("n")); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
+		}
+		if err := w.CheckString(time.Now(), "n"); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
+		}
+		if w.Stats() != (Stats{}) {
+			t.Error("nil or zero window reports entries")
+		}
 	}
 }
 
@@ -362,4 +364,44 @@ func TestDefaultMemory(t *testing.T) {
 		t.Fatalf("a new default Window allocates %d KiB", kib)
 	}
 	runtime.KeepAlive(w)
+}
+
+func TestStatsEvicted(t *testing.T) {
+	clk := newFakeClock()
+	w := mustNew(t, Config{Now: clk.Now, Window: time.Hour, Capacity: 2, Shards: 1})
+	for i := range uint64(5) {
+		clk.Advance(time.Millisecond)
+		if err := w.Check(clk.Now(), nonce(i)); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	if st := w.Stats(); st != (Stats{Len: 2, Capacity: 2, Evicted: 3}) {
+		t.Fatalf("Stats = %+v", st)
+	}
+}
+
+func TestConfigJSON(t *testing.T) {
+	var c Config
+	if err := json.Unmarshal([]byte(`{"window":"30s","skew":"5s","capacity":4096,"shards":2,"full":"rejectnew"}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	want := Config{Window: 30 * time.Second, Skew: 5 * time.Second, Capacity: 4096, Shards: 2, Full: RejectNew}
+	if c.Now != nil || c.Window != want.Window || c.Skew != want.Skew || c.Capacity != want.Capacity ||
+		c.Shards != want.Shards || c.Full != want.Full {
+		t.Fatalf("got %+v", c)
+	}
+	// Absent fields keep their value.
+	if err := json.Unmarshal([]byte(`{"skew":"1s"}`), &c); err != nil || c.Window != want.Window || c.Skew != time.Second {
+		t.Fatalf("partial: %v %+v", err, c)
+	}
+	for _, bad := range []string{`{"window":30}`, `{"window":"x"}`, `{"full":"Drop"}`, `{"windw":"1s"}`, `{"full":1}`, `[]`} {
+		if err := json.Unmarshal([]byte(bad), &c); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	for _, p := range []FullPolicy{ShrinkWindow, RejectNew} {
+		if q, err := ParseFullPolicy(p.String()); err != nil || q != p {
+			t.Errorf("ParseFullPolicy(%v) = %v, %v", p, q, err)
+		}
+	}
 }
