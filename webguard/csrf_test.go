@@ -274,7 +274,7 @@ func TestCSRFAllocs(t *testing.T) {
 	clk.Advance(2 * time.Minute)
 	fresh, _ := x.Token("s")
 	for token, want := range map[string]error{fresh: nil, old: ErrCSRFToken, fresh[:CSRFTokenLen-1] + "A": ErrCSRFToken} {
-		if err := x.Verify("s", token); !errors.Is(err, want) && err != want {
+		if err := x.Verify("s", token); !errors.Is(err, want) {
 			t.Fatalf("Verify = %v, want %v", err, want)
 		}
 		if n := testing.AllocsPerRun(100, func() { _ = x.Verify("s", token) }); n != 0 {

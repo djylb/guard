@@ -118,16 +118,6 @@ type Config struct {
 	// TrustedOrigins lists origins, such as "https://admin.example.com",
 	// whose unsafe requests are allowed although they are cross-origin.
 	TrustedOrigins []string
-	// LoopbackHosts also allows the Host names that only a loopback
-	// server answers to: "localhost" and loopback IP addresses, on any
-	// port.
-	LoopbackHosts bool
-	// LoopbackPeers allows clients with a loopback address, protecting a
-	// server accidentally bound to all interfaces. With LoopbackPeers or
-	// Peers set, other clients are rejected, and so is every request over
-	// a Unix socket, whose RemoteAddr is not an IP address; leave both
-	// off there.
-	LoopbackPeers bool
 	// Peers lists the client networks, as "ip" or "ip/bits", that are
 	// allowed, such as a VPN's. The client is the one ClientAddr returns.
 	Peers []string
@@ -143,6 +133,16 @@ type Config struct {
 	// X-Real-IP, works too, and "Forwarded" reads the for parameters of
 	// RFC 7239. It must be a valid header name.
 	ForwardedHeader string
+	// LoopbackHosts also allows the Host names that only a loopback
+	// server answers to: "localhost" and loopback IP addresses, on any
+	// port.
+	LoopbackHosts bool
+	// LoopbackPeers allows clients with a loopback address, protecting a
+	// server accidentally bound to all interfaces. With LoopbackPeers or
+	// Peers set, other clients are rejected, and so is every request over
+	// a Unix socket, whose RemoteAddr is not an IP address; leave both
+	// off there.
+	LoopbackPeers bool
 	// RequireOrigin rejects unsafe requests that carry neither
 	// Sec-Fetch-Site nor Origin unless their Referer is same-origin.
 	RequireOrigin bool
@@ -449,9 +449,11 @@ func parseNode(s string) (netip.Addr, bool) {
 			return netip.Addr{}, false
 		}
 	case hasPort(s):
-		var ap netip.AddrPort
-		ap, err = netip.ParseAddrPort(s)
-		a = ap.Addr()
+		if ap, perr := netip.ParseAddrPort(s); perr == nil {
+			a = ap.Addr()
+		} else {
+			err = perr
+		}
 	case strings.IndexByte(s, '%') >= 0 || ipChars(s):
 		a, err = netip.ParseAddr(s)
 	default:
