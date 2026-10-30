@@ -1,13 +1,13 @@
 package webguard
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"mime"
 	"net/http"
+	"net/textproto"
+	"strings"
 	"time"
 
 	"github.com/djylb/guard/internal/conf"
@@ -31,6 +31,7 @@ var (
 // Defaults of CSRFConfig.
 const (
 	DefaultCSRFMaxAge = 12 * time.Hour
+	DefaultCSRFSkew   = time.Minute
 	DefaultCSRFHeader = "X-CSRF-Token"
 	DefaultCSRFField  = "csrf_token"
 	// MinCSRFKeySize is the minimum length of CSRFConfig.Key and
@@ -40,21 +41,13 @@ const (
 
 const (
 	csrfVersion   = 1
-	csrfHeaderLen = 1 + 8 + 16
+	csrfHeaderLen = 1 + 8 + sign.NonceSize
 	csrfRawLen    = csrfHeaderLen + sign.Size
 	// CSRFTokenLen is the length of a CSRF token string.
 	CSRFTokenLen = (csrfRawLen*8 + 5) / 6
-	// csrfClockSkew tolerates tokens issued by servers whose clocks run
-	// slightly ahead.
-	csrfClockSkew = time.Minute
 )
 
 const csrfDomain = "guard/csrf/v1"
-
-var (
-	csrfEnc    = base64.RawURLEncoding
-	csrfStrict = csrfEnc.Strict()
-)
 
 // CSRFConfig configures a CSRF.
 type CSRFConfig struct {
@@ -64,8 +57,9 @@ type CSRFConfig struct {
 	// wraps ErrCSRFToken or ErrNoSession. It defaults to a plain 403
 	// Forbidden.
 	Deny func(w http.ResponseWriter, r *http.Request, err error)
-	// Header is the request header Handler reads the token from. It
-	// defaults to DefaultCSRFHeader.
+	// Header is the request header Handler reads the token from, a
+	// valid header name compared case-insensitively. It defaults to
+	// DefaultCSRFHeader.
 	Header string
 	// Field is the form field Handler reads the token from when the
 	// header is absent. It defaults to DefaultCSRFField.
@@ -81,6 +75,10 @@ type CSRFConfig struct {
 	// MaxAge is how long a token stays valid, at millisecond precision
 	// and at least a millisecond. It defaults to DefaultCSRFMaxAge.
 	MaxAge time.Duration
+	// Skew is how far ahead of this server's clock the clock of a server
+	// that issued a token may run. It defaults to DefaultCSRFSkew and
+	// must not be negative.
+	Skew time.Duration
 	// MultipartForms also reads the token from multipart/form-data
 	// bodies when the header is absent. Parsing one reads the whole body,
 	// keeping up to 32 MiB in memory and spilling the rest to temporary
@@ -90,25 +88,39 @@ type CSRFConfig struct {
 	MultipartForms bool
 }
 
+// csrfJSON is the JSON form of a CSRFConfig.
+type csrfJSON struct {
+	Header         string        `json:"header"`
+	Field          string        `json:"field"`
+	Key            conf.Key      `json:"key,omitzero"`
+	PreviousKeys   [][]byte      `json:"previous_keys,omitempty"`
+	MaxAge         conf.Duration `json:"max_age"`
+	Skew           conf.Duration `json:"skew"`
+	MultipartForms bool          `json:"multipart_forms"`
+}
+
+// json returns c in JSON form, with the key absent.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c *CSRFConfig) json() csrfJSON {
+	return csrfJSON{c.Header, c.Field, conf.Key{}, c.PreviousKeys, conf.Duration(c.MaxAge), conf.Duration(c.Skew), c.MultipartForms}
+}
+
 // UnmarshalJSON reads a CSRFConfig from a JSON object such as
 //
 //	{"key": "base64...", "max_age": "12h"}
 //
 // with the fields header, field, key and previous_keys (standard base64),
-// max_age and multipart_forms. Durations are strings in the form of
-// time.ParseDuration. Fields that are absent keep their value; unknown
-// fields and null values are an error. The key is required unless the
-// CSRFConfig already has one; "key": "random" asks for a key generated per
-// process. Now and Deny cannot be set from JSON.
+// max_age, skew and multipart_forms. Durations are strings in the form of
+// time.ParseDuration. Fields that are absent keep their value; unknown,
+// repeated and null fields are an error, and names must match exactly.
+// The key is required unless the CSRFConfig already has one; "key":
+// "random" asks for a key generated per process. Now and Deny cannot be
+// set from JSON.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (c *CSRFConfig) UnmarshalJSON(data []byte) error {
-	v := struct {
-		Header         string        `json:"header"`
-		Field          string        `json:"field"`
-		Key            conf.Key      `json:"key"`
-		PreviousKeys   [][]byte      `json:"previous_keys"`
-		MaxAge         conf.Duration `json:"max_age"`
-		MultipartForms bool          `json:"multipart_forms"`
-	}{c.Header, c.Field, conf.Key{}, c.PreviousKeys, conf.Duration(c.MaxAge), c.MultipartForms}
+	v := c.json()
 	if err := conf.Decode(data, &v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
@@ -117,8 +129,20 @@ func (c *CSRFConfig) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	c.Header, c.Field, c.Key, c.PreviousKeys = v.Header, v.Field, key, v.PreviousKeys
-	c.MaxAge, c.MultipartForms = time.Duration(v.MaxAge), v.MultipartForms
+	c.MaxAge, c.Skew, c.MultipartForms = time.Duration(v.MaxAge), time.Duration(v.Skew), v.MultipartForms
 	return nil
+}
+
+// MarshalJSON writes c in the form UnmarshalJSON reads, for logging the
+// effective configuration. It writes no secret: the key is "random" if
+// it is nil and left out otherwise, and PreviousKeys, Now and Deny are
+// left out.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c CSRFConfig) MarshalJSON() ([]byte, error) {
+	v := c.json()
+	v.Key, v.PreviousKeys = conf.Redacted(c.Key), nil
+	return json.Marshal(v)
 }
 
 // CSRF issues and verifies tokens that bind state-changing requests to a
@@ -136,9 +160,10 @@ type CSRF struct {
 	now       func() time.Time
 	deny      func(http.ResponseWriter, *http.Request, error)
 	signer    *sign.Signer
-	header    string
+	header    string // canonical
 	field     string
 	maxAge    time.Duration
+	skew      time.Duration
 	multipart bool
 }
 
@@ -151,7 +176,10 @@ func NewCSRF(c CSRFConfig) (*CSRF, error) {
 	if c.MaxAge < 0 || (c.MaxAge > 0 && c.MaxAge < time.Millisecond) {
 		return nil, fmt.Errorf("%w: CSRF MaxAge %v is negative or below a millisecond", ErrInvalidConfig, c.MaxAge)
 	}
-	x := &CSRF{now: c.Now, deny: c.Deny, signer: signer, header: c.Header, field: c.Field, maxAge: c.MaxAge, multipart: c.MultipartForms}
+	if c.Skew < 0 {
+		return nil, fmt.Errorf("%w: CSRF Skew %v is negative", ErrInvalidConfig, c.Skew)
+	}
+	x := &CSRF{now: c.Now, deny: c.Deny, signer: signer, header: c.Header, field: c.Field, maxAge: c.MaxAge, skew: c.Skew, multipart: c.MultipartForms}
 	if x.now == nil {
 		x.now = time.Now
 	}
@@ -160,6 +188,14 @@ func NewCSRF(c CSRFConfig) (*CSRF, error) {
 	}
 	if x.header == "" {
 		x.header = DefaultCSRFHeader
+	}
+	if !validToken(x.header) {
+		return nil, fmt.Errorf("%w: CSRF header %q is not a header name", ErrInvalidConfig, x.header)
+	}
+	// Stored in canonical form, so that reading it needs no conversion.
+	x.header = textproto.CanonicalMIMEHeaderKey(x.header)
+	if x.skew == 0 {
+		x.skew = DefaultCSRFSkew
 	}
 	if x.field == "" {
 		x.field = DefaultCSRFField
@@ -183,36 +219,30 @@ func (x *CSRF) Token(session string) (string, error) {
 	var raw [csrfRawLen]byte
 	raw[0] = csrfVersion
 	binary.BigEndian.PutUint64(raw[1:9], uint64(x.now().UnixMilli()))
-	_, _ = rand.Read(raw[9:csrfHeaderLen]) // crypto/rand.Read never fails
-	mac := x.signer.Sign(raw[:csrfHeaderLen], session)
-	copy(raw[csrfHeaderLen:], mac[:])
-	return csrfEnc.EncodeToString(raw[:]), nil
+	return x.signer.Seal(raw[:], session), nil
 }
 
 // Verify checks that token was issued for session within MaxAge, with the
-// key or one of the previous keys.
-func (x *CSRF) Verify(session, token string) error {
+// key or one of the previous keys. It does not allocate. Unlike a
+// challenge, a token stays valid for its whole MaxAge and may be used
+// many times: it binds requests to a session, it does not count them.
+func (x *CSRF) Verify(token, session string) error {
 	if x == nil || x.signer == nil {
 		return ErrUninitialized
 	}
 	if session == "" {
 		return ErrNoSession
 	}
-	if len(token) != CSRFTokenLen {
-		return ErrCSRFToken
-	}
-	var src [CSRFTokenLen]byte
-	copy(src[:], token)
 	var raw [csrfRawLen]byte
-	if n, err := csrfStrict.Decode(raw[:], src[:]); err != nil || n != csrfRawLen || raw[0] != csrfVersion {
+	if !sign.Open(raw[:], token) || raw[0] != csrfVersion {
 		return ErrCSRFToken
 	}
-	if !x.signer.Verify(raw[csrfHeaderLen:], raw[:csrfHeaderLen], session) {
+	if !x.signer.Check(raw[:], session) {
 		return ErrCSRFToken
 	}
 	issued := binary.BigEndian.Uint64(raw[1:9])
 	now := x.now().UnixMilli()
-	if now < 0 || issued > uint64(now)+uint64(csrfClockSkew.Milliseconds()) ||
+	if now < 0 || issued > uint64(now)+uint64(x.skew.Milliseconds()) ||
 		(uint64(now) > issued && uint64(now)-issued > uint64(x.maxAge.Milliseconds())) {
 		return errCSRFExpired
 	}
@@ -227,6 +257,9 @@ func (x *CSRF) Verify(session, token string) error {
 // MultipartForms. Reading a form parses the body: limit its size with
 // http.MaxBytesReader first. A zero CSRF rejects every unsafe request.
 //
+// Checking a token from the header does not allocate, nor does rejecting
+// a request without one; parsing a form body allocates inside net/http.
+//
 // To protect a login form, which has no session yet, give the visitor a
 // pre-session cookie and use it as the session.
 func (x *CSRF) Handler(session func(*http.Request) string, h http.Handler) http.Handler {
@@ -236,7 +269,7 @@ func (x *CSRF) Handler(session func(*http.Request) string, h http.Handler) http.
 				deny(w, r, ErrUninitialized)
 				return
 			}
-			if err := x.Verify(session(r), x.requestToken(r)); err != nil {
+			if err := x.Verify(x.requestToken(r), session(r)); err != nil {
 				x.deny(w, r, err)
 				return
 			}
@@ -246,12 +279,22 @@ func (x *CSRF) Handler(session func(*http.Request) string, h http.Handler) http.
 }
 
 func (x *CSRF) requestToken(r *http.Request) string {
-	if t := r.Header.Get(x.header); t != "" {
-		return t
+	if v := r.Header[x.header]; len(v) > 0 && v[0] != "" {
+		return v[0]
 	}
-	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	var ct string
+	if v := r.Header["Content-Type"]; len(v) > 0 {
+		ct = v[0]
+	}
+	// Compare the media type by hand, as net/http does to pick its form
+	// parser, rather than with mime.ParseMediaType, which allocates.
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.TrimSpace(ct)
 	switch {
-	case mt == "application/x-www-form-urlencoded", mt == "multipart/form-data" && x.multipart:
+	case strings.EqualFold(ct, "application/x-www-form-urlencoded"),
+		x.multipart && strings.EqualFold(ct, "multipart/form-data"):
 		return r.PostFormValue(x.field)
 	default:
 		return ""

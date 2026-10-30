@@ -52,11 +52,11 @@ func TestCSRFSubSecondMaxAge(t *testing.T) {
 	x := mustCSRF(t, CSRFConfig{Now: clk.Now, MaxAge: 1500 * time.Millisecond})
 	tok, _ := x.Token("s")
 	clk.Advance(1100 * time.Millisecond)
-	if err := x.Verify("s", tok); err != nil {
+	if err := x.Verify(tok, "s"); err != nil {
 		t.Fatalf("within MaxAge: %v", err)
 	}
 	clk.Advance(401 * time.Millisecond)
-	if err := x.Verify("s", tok); !errors.Is(err, ErrCSRFToken) {
+	if err := x.Verify(tok, "s"); !errors.Is(err, ErrCSRFToken) {
 		t.Fatalf("after MaxAge: %v", err)
 	}
 	if _, err := NewCSRF(CSRFConfig{MaxAge: time.Microsecond}); !errors.Is(err, ErrInvalidConfig) {

@@ -20,17 +20,21 @@ func TestPackageDependencies(t *testing.T) {
 		t.Skip("no go command")
 	}
 	const module = "github.com/djylb/guard"
-	conf, num, sign := module+"/internal/conf", module+"/internal/num", module+"/internal/sign"
+	const internal = module + "/internal/"
+	addr, clock, conf, num, race, sign := internal+"addr", internal+"clock", internal+"conf", internal+"num", internal+"race", internal+"sign"
 	allowed := map[string][]string{
 		module:               nil,
+		addr:                 nil,
+		clock:                nil,
 		conf:                 nil,
 		num:                  nil,
-		sign:                 nil,
-		module + "/replay":   {conf, num},
-		module + "/pow":      {module + "/replay", conf, num, sign},
-		module + "/failban":  {conf, num},
-		module + "/otp":      nil,
-		module + "/webguard": {conf, sign},
+		race:                 nil,
+		sign:                 {race},
+		module + "/replay":   {clock, conf, num},
+		module + "/pow":      {module + "/replay", clock, conf, num, race, sign},
+		module + "/failban":  {addr, clock, conf, num},
+		module + "/otp":      {conf},
+		module + "/webguard": {addr, conf, race, sign},
 	}
 	listed, err := exec.Command(goCmd, "list", module+"/...").Output()
 	if err != nil {

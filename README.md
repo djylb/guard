@@ -10,9 +10,11 @@ one-time passwords, and HTTP middleware against DNS rebinding and CSRF.
   reclaimed deterministically by the calls that use it.
 - Safe for concurrent use, with sharded locks on the hot paths. Replay,
   ban, challenge, one-time password, CSRF token and request checks do not
-  allocate, also when they reject. The exception is a cross-origin check
-  of a request that carries Origin but no Sec-Fetch-Site, where
-  `http.CrossOriginProtection` parses the Origin.
+  allocate, also when they reject. The exceptions are inside the standard
+  library or the caller's code: a cross-origin check of a request that
+  carries Origin but no Sec-Fetch-Site, where `http.CrossOriginProtection`
+  parses the Origin; reading a CSRF token from a form body, which
+  `net/http` parses; and wrapping an error of a custom `pow.Store`.
 - Zero values never panic and never run with an empty key: types that
   hold a key report an error, a zero `failban.Limiter` reports every key
   banned, and a zero `webguard.Guard` or `CSRF` rejects requests.
@@ -37,9 +39,13 @@ Requires Go 1.26 or later.
 
 Every `Config` also decodes from JSON, so it can sit in a service's config
 file. Durations are strings such as `"15m"`, policies are names such as
-`"EvictSoonest"`, keys are standard base64, and unknown fields and nulls
-are errors rather than silent defaults. A key must be given, or asked for
-as `"random"`, valid only in this process:
+`"EvictSoonest"`, keys are standard base64, and unknown, misspelt or
+differently cased, repeated and null fields are errors rather than silent
+defaults. A key must be given, or asked for as `"random"`, valid only in
+this process. Configs also encode to the same form, for logging the
+effective settings; keys are never written. The policy and algorithm
+enums implement `encoding.TextMarshaler`, so they read and write as
+names wherever they are embedded:
 
 ```go
 var conf struct {
@@ -73,6 +79,10 @@ if err := w.Check(msg.Time, msg.Nonce); err != nil {
   the default. Pages that see few messages, such as a login form, can set
   `Capacity: 4096`. A nonce is remembered for `Window + Skew` and
   forgotten in acceptance order, at amortised O(1) per check.
+- **Shards.** The table is split into independently locked shards, and
+  the full policy acts per shard. By default each shard holds at least
+  256 nonces, so a small window has one shard and holds its whole
+  `Capacity`; an explicit `Shards` splits it further.
 - **When full, never a replay.** With `ShrinkWindow` (the default), a full
   shard forgets its oldest nonce early and from then on rejects every
   timestamp at or below that nonce's as stale: the window shrinks rather
@@ -107,7 +117,8 @@ err = c.Verify(token, solution, clientIP, "login")  // pow.ErrReplay on reuse
 
 Verify checks the expiry, then the work with one SHA-256 hash, then the
 signature (compared in constant time), and finally whether the challenge
-was already used, in a `Store`. A successful Verify does not allocate.
+was already used, in a `Store`. Verify does not allocate, also when it
+rejects, apart from wrapping an error of a custom `Store`.
 The binding is a list of strings, each length-prefixed in the MAC, so
 `("ab", "c")` and `("a", "bc")` differ. The default store holds up to
 `ReplayCapacity` (64 Ki) challenges and grows with use to about 5 MiB;
@@ -132,8 +143,9 @@ type Store interface {
 
 Store errors reject the challenge (`pow.ErrStore`). `IssueDifficulty` raises
 the cost per challenge, for example while the service is under attack.
-`Parse` and `Check` let clients read and test tokens. `MemoryStore.Stats`
-reports the use of a store you create yourself.
+`Parse` and `Check` let clients read and test tokens. `Challenger.Stats`
+reports the use of its `MemoryStore`, the default one included: if
+`Evicted` grows, `ReplayCapacity` is too small.
 
 Browser clients can solve challenges themselves. A token is the unpadded
 base64url encoding of `version (1) | difficulty (1) | expiry ms (8) |
@@ -158,13 +170,19 @@ users, err := failban.New[string](failban.Config{
 ips, err := failban.New[netip.Prefix](failban.Config{Threshold: 20, Full: failban.EvictSoonest})
 
 prefix, err := failban.PrefixLen{V4: 32, V6: 64}.OfRemote(r.RemoteAddr)
-ip, user := ips.Attempt(prefix), users.Attempt(name)
-if !ip.Allowed() || !user.Allowed() {
-	ip.Release() // release whichever reservation was made
-	user.Release()
-	retry := max(ip.RetryAfter(), user.RetryAfter())
+tooMany := func(retry time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)))
 	http.Error(w, "too many attempts", http.StatusTooManyRequests)
+}
+ip := ips.Attempt(prefix) // the client first: a refused one stops here
+if !ip.Allowed() {
+	tooMany(ip.RetryAfter())
+	return
+}
+user := users.Attempt(name)
+if !user.Allowed() {
+	ip.Release()
+	tooMany(user.RetryAfter())
 	return
 }
 if !checkPassword(name, password) { // slow, so at most Threshold run at once
@@ -187,10 +205,16 @@ user.Succeed() // clears the account's failures
   clears them. Use `Succeed` only where the success proves the key is
   the caller's, such as an account name. On an IP limiter, an attacker
   could clear its prefix by logging into its own account. `IsBanned` and
-  `BannedUntil` are read-only, for display.
+  `BannedUntil` are read-only, for display. Reserve the client's key
+  before the account's, as above, so that a banned client never touches
+  the account limiter. `Limiter.Fail` and `Limiter.Succeed` act without a
+  reservation: for failures found without an expensive check, such as a
+  forged request, and for clearing an account after it proved itself
+  another way.
 - **Settled once.** Each reservation has an identity, so a copied
   `Attempt` cannot settle it twice and let more than `Threshold` attempts
-  run. Keys without failures reuse counters, so attempts do not allocate.
+  run. A counter is freed as soon as its key has nothing left to count,
+  and freed counters are reused, so attempts do not allocate.
 - **Retry-After.** `RetryAfter` of a refused attempt is the time until
   its ban ends, in whole seconds and at least one.
 - **Counting.** Failures are counted in eight time buckets per key, which
@@ -201,8 +225,11 @@ user.Succeed() // clears the account's failures
   `MaxBanDuration`. A `Result` tells whether a failure started a ban, for
   logging each ban once.
 - **Bounded memory.** When `MaxPending` pending counters are reached, the
-  least recently updated one is evicted. Flooding can reset pending
-  counts this way, but never lifts a ban.
+  least recently updated one is evicted. Only keys with failures or
+  attempts in flight hold a counter, so flooding takes real failures or
+  held attempts; it can reset pending counts, but never lifts a ban.
+  `MaxPending`, `MaxBans` and `Full` apply per shard; by default each
+  shard holds at least 256 of each, so a small limiter has one shard.
 - **Full ban table.** Records of ended bans are dropped first. When all
   `MaxBans` records are active bans, `Full` decides:
   - `LockShard` (default) keeps every ban and reports every key of the
@@ -219,17 +246,18 @@ user.Succeed() // clears the account's failures
 
   A key that reaches `Threshold` during a lockdown is reported banned and
   gets its ban as soon as a record is free.
-- **Persistence and manual bans.** `Bans` lists the active bans; `Ban`
-  bans a key until a given time, for an administrator or to restore the
-  saved list after a restart. Pending failures and the offences of ended
-  bans are not saved.
+- **Persistence and manual bans.** `Bans` lists the ban records: active
+  bans, and ended ones whose offences are kept for `Cooldown`. `Ban`
+  bans a key until a given time, for an administrator, or restores the
+  saved records after a restart, ended ones in cooldown, so repeat
+  offenders keep their longer bans. Pending failures are not saved.
 - **Deterministic cleanup.** Cleanup is done by the calls that change a
   shard, plus an optional `Sweep`. Nothing runs at random or in the
   background, and every per-key operation takes amortised constant time.
 - **Observability.** `Stats` returns sizes (pending, banned, cooling,
   waiting, locked shards) and counters (failures, bans started, attempts
-  refused, bans evicted). `Failures` returns a key's count. `Unban` and
-  `Reset` are for administrators.
+  refused, bans evicted). `Failures` returns a key's count, zero while it
+  is reported banned. `Unban` and `Reset` are for administrators.
 
 Key IPv6 clients by prefix (`/64` or `/56`), not by single address: a
 single host may hold billions of addresses. A single `/48` holds 65536
@@ -243,7 +271,7 @@ full address, never `/0`. Behind a reverse proxy, key on
 
 ```go
 secret, err := otp.GenerateSecret(otp.DefaultSecretSize) // 160 bits
-key := &otp.Key{Issuer: "Example", Account: "alice", Secret: secret, Skew: 1}
+key := &otp.Key{Issuer: "Example", Account: "alice", Secret: secret, SkewSteps: 1}
 uri, err := key.URI() // otpauth://totp/Example:alice?secret=...; render as a QR code
 
 // At login:
@@ -260,14 +288,15 @@ account.NextStep = next // persist atomically (compare-and-swap)
   accepted once, or any code from an earlier step, is rejected with
   `ErrCodeReused`. The value lives in the caller's account store, so
   several instances share it. `VerifyCounter` does the same for HOTP and
-  resynchronises within `Skew` counters.
+  resynchronises within `SkewSteps` counters. A key's `Kind` selects its
+  methods: a TOTP key refuses `VerifyCounter` and an HOTP key `Verify`.
 - **Recovery.** If the stored step lies beyond what the clock allows,
   because the server clock was once ahead or the state came from
   elsewhere, every correct code would be refused until the clock catches
   up. `Verify` reports that case as `ErrStepAhead`. Once the user has
   proved their identity another way, reset the stored step to
   `key.Step(now)`.
-- **Guessing.** A six-digit code is guessed with probability 2·Skew+1 in a
+- **Guessing.** A six-digit code is guessed with probability 2·SkewSteps+1 in a
   million per try. Limit tries per account and per client with
   `failban`, and answer every rejected code alike: telling
   `ErrCodeReused` from `ErrCodeMismatch` confirms that a code was right.
@@ -275,8 +304,11 @@ account.NextStep = next // persist atomically (compare-and-swap)
   period. Secrets must be at least 128 bits (RFC 4226). Accounts enrolled
   elsewhere with 80-bit secrets can opt in with `Key.AllowShortSecret`;
   re-enrol them when possible.
-- Keep `Skew` small. Each extra step costs one HMAC per check and raises
-  the chance that a guess matches.
+- Keep `SkewSteps` small. Each extra step costs one HMAC per check and
+  raises the chance that a guess matches.
+- **Storage.** A `Key` encodes to JSON with its secret in base32, for
+  the account store; `URI` and `ParseURI` carry everything except
+  `SkewSteps` and `AllowShortSecret`.
 - **Strict parsing.** A code must be exactly `Digits` ASCII digits: no
   sign, no spaces. `DecodeSecret` accepts lower case and missing padding
   but nothing else. `ParseURI` rejects repeated or contradictory
@@ -302,7 +334,12 @@ token, err := csrf.Token(sessionID(r)) // hidden field "csrf_token" or header X-
 1. **Peer.** With `LoopbackPeers`, the client may be a loopback address,
    which protects a server bound to all interfaces by mistake; `Peers`
    lists further allowed networks, such as a VPN's. With either set,
-   other clients are rejected.
+   other clients are rejected, and so is a request that carries a
+   forwarding header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`,
+   `True-Client-IP`, `X-Client-IP`, `X-Forwarded-Host` or
+   `ForwardedHeader`) from a peer outside `TrustedProxies`: a reverse
+   proxy on the same host connects from loopback for remote clients, so
+   `LocalAdmin` alone must not be put behind one.
 2. **Host allowlist.** The Host header must be one of `Hosts` (an exact
    name or IP, with or without a port), or a loopback name with
    `LoopbackHosts`. This stops DNS rebinding: a malicious site whose name
@@ -349,9 +386,11 @@ double-submit cookies. A double-submit cookie can be overwritten from a
 sibling subdomain or over plain HTTP. A signed token is valid only for
 the session it was issued for. Each token carries a random nonce and its
 issue time, so tokens differ per response, which resists compression
-side channels, and expire after `MaxAge` (millisecond precision). The
-handler reads the token from the `X-CSRF-Token` header or a URL-encoded
-form field. It parses multipart bodies only with `MultipartForms`,
+side channels, and expire after `MaxAge` (millisecond precision); `Skew`
+tolerates issuers whose clocks run ahead. Unlike a challenge, a token may
+be used many times within `MaxAge`. `Verify(token, session)` checks one
+by hand. The handler reads the token from the `X-CSRF-Token` header,
+any valid header name set as `Header`, or a URL-encoded form field. It parses multipart bodies only with `MultipartForms`,
 because parsing reads the whole body before the token is checked. On
 browsers since 2023 the cross-origin check alone already stops CSRF;
 tokens add defence in depth. `PreviousKeys` keeps tokens signed with an
@@ -373,10 +412,11 @@ subdomains, which count as the same site; the cross-origin check does.
   challenge can therefore be used once on each server that shares the
   key, and once more after a restart, unless the servers share a
   `Store`.
-- `failban`: flooding with new keys can reset other keys' pending
-  counters and reservations, never their bans. This bounds an attacker
-  to `Threshold` extra attempts per key for each `MaxPending` keys
-  flooded. A full ban table locks the shard for everyone (`LockShard`,
+- `failban`: flooding with new keys that fail, or hold attempts in
+  flight, can reset other keys' pending counters and reservations, never
+  their bans. This bounds an attacker to `Threshold` extra attempts per
+  key for each `MaxPending` failures it makes, each of which costs a
+  check and counts against its own client keys. A full ban table locks the shard for everyone (`LockShard`,
   the default) or ends the soonest-ending bans early (`EvictSoonest`, for
   IP-prefix keys). Size `MaxBans` for the attack you expect, and key by
   prefix. Settle every `Attempt`: a reservation that is never settled

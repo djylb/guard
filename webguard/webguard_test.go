@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	iaddr "github.com/djylb/guard/internal/addr"
 )
 
 var okHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -430,7 +432,7 @@ func FuzzClientAddr(f *testing.F) {
 			t.Fatalf("ClientAddr(%q, %q) = %v", remote, xff, addr)
 		}
 		// The client is the peer, or an address from the header.
-		if peer, _ := parseNode(remote); addr != peer && !contains(g.proxies, peer) {
+		if peer, _ := iaddr.Parse(remote); addr != peer && !contains(g.proxies, peer) {
 			t.Fatalf("ClientAddr(%q, %q) = %v from an untrusted peer's header", remote, xff, addr)
 		}
 	})
@@ -553,5 +555,52 @@ func TestRejectAllocs(t *testing.T) {
 		if got := sameOriginReferer(r); got != ok {
 			t.Errorf("Referer %q: %v, want %v", ref, got, ok)
 		}
+	}
+}
+
+// TestLoopbackBehindLocalProxy is a regression test: a reverse proxy on
+// the same host connects from loopback for remote clients, so a request
+// it forwards must not pass LoopbackPeers when the proxy is not trusted.
+func TestLoopbackBehindLocalProxy(t *testing.T) {
+	g := mustGuard(t, LocalAdmin())
+	for _, h := range []string{"X-Forwarded-For", "Forwarded", "X-Real-IP", "True-Client-IP", "X-Client-IP", "X-Forwarded-Host", "x-forwarded-for"} {
+		r := request(http.MethodGet, "127.0.0.1:8080", "127.0.0.1:5000", map[string]string{h: "203.0.113.9"})
+		if err := g.Check(r); !errors.Is(err, ErrPeer) {
+			t.Errorf("%s from an untrusted loopback proxy: %v", h, err)
+		}
+	}
+	if err := g.Check(request(http.MethodGet, "127.0.0.1:8080", "127.0.0.1:5000", nil)); err != nil {
+		t.Fatalf("direct loopback client rejected: %v", err)
+	}
+	// Listed as a trusted proxy, the forwarded client is checked instead.
+	c := LocalAdmin()
+	c.TrustedProxies = []string{"127.0.0.1"}
+	g = mustGuard(t, c)
+	if err := g.Check(request(http.MethodGet, "localhost", "127.0.0.1:5000", map[string]string{"X-Forwarded-For": "203.0.113.9"})); !errors.Is(err, ErrPeer) {
+		t.Fatalf("remote client through a trusted proxy: %v", err)
+	}
+	if err := g.Check(request(http.MethodGet, "localhost", "127.0.0.1:5000", map[string]string{"X-Forwarded-For": "::1"})); err != nil {
+		t.Fatalf("local client through a trusted proxy: %v", err)
+	}
+	// Without peer checks, forwarding headers do not matter.
+	g = mustGuard(t, Config{Hosts: []string{"x"}})
+	if err := g.Check(request(http.MethodGet, "x", "127.0.0.1:5000", map[string]string{"X-Forwarded-For": "203.0.113.9"})); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfigMarshalJSON(t *testing.T) {
+	c := Config{Hosts: []string{"a"}, TrustedProxies: []string{"10.0.0.1"}, LoopbackPeers: true}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Config
+	if err := json.Unmarshal(b, &got); err != nil || got.Hosts[0] != "a" || got.TrustedProxies[0] != "10.0.0.1" || !got.LoopbackPeers {
+		t.Fatalf("%s -> %+v, %v", b, got, err)
+	}
+	b, err = json.Marshal(CSRFConfig{Key: testKey, PreviousKeys: [][]byte{testKey}, Skew: time.Second})
+	if err != nil || strings.Contains(string(b), "key") || !strings.Contains(string(b), `"skew":"1s"`) {
+		t.Fatalf("CSRFConfig JSON %s, %v", b, err)
 	}
 }

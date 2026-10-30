@@ -43,13 +43,18 @@ func (l *login) check(remoteAddr, name string, password func() bool) error {
 	if err != nil {
 		return err
 	}
+	// Reserve the client first: a refused client does not touch the
+	// account limiter.
 	ip := l.ips.Attempt(prefix)
-	user := l.users.Attempt(name)
-	if !ip.Allowed() || !user.Allowed() {
-		ip.Release() // release whichever reservation was made
-		user.Release()
+	if !ip.Allowed() {
 		// Over HTTP: 429 with Retry-After set to this many seconds.
-		_ = max(ip.RetryAfter(), user.RetryAfter()) / time.Second
+		_ = ip.RetryAfter() / time.Second
+		return errTooManyAttempts
+	}
+	user := l.users.Attempt(name)
+	if !user.Allowed() {
+		ip.Release()
+		_ = user.RetryAfter() / time.Second
 		return errTooManyAttempts
 	}
 	if !password() { // the slow check runs at most Threshold times at once

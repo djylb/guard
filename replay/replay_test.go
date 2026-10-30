@@ -405,3 +405,42 @@ func TestConfigJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestSmallCapacityOutOfOrder is a regression test: a small window must
+// hold its whole capacity of out-of-order messages, whatever GOMAXPROCS,
+// rather than be cut into shards that fill after a few entries.
+func TestSmallCapacityOutOfOrder(t *testing.T) {
+	clk := newFakeClock()
+	for _, capacity := range []int{64, 256} {
+		w := mustNew(t, Config{Now: clk.Now, Window: time.Hour, Capacity: capacity})
+		now := clk.Now()
+		for i := range capacity {
+			if err := w.Check(now.Add(-time.Duration(i)*time.Millisecond), nonce(uint64(i))); err != nil {
+				t.Fatalf("capacity %d: message %d rejected: %v", capacity, i, err)
+			}
+		}
+		if st := w.Stats(); st.Len != capacity || st.Evicted != 0 {
+			t.Fatalf("capacity %d: %+v", capacity, st)
+		}
+	}
+}
+
+func TestConfigJSONRoundTrip(t *testing.T) {
+	c := Config{Window: 30 * time.Second, Skew: time.Second, Capacity: 100, Shards: 2, Full: RejectNew}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Config
+	if err := json.Unmarshal(b, &got); err != nil || got.Window != c.Window || got.Skew != c.Skew || got.Capacity != c.Capacity || got.Shards != c.Shards || got.Full != c.Full {
+		t.Fatalf("%s -> %+v, %v", b, got, err)
+	}
+	for _, bad := range []string{`{"WINDOW": "1s"}`, `{"window": "1s", "window": "2s"}`, `{"full": 1}`} {
+		if err := json.Unmarshal([]byte(bad), &got); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	if _, err := json.Marshal(Config{Full: FullPolicy(9)}); err == nil {
+		t.Error("unknown policy marshalled")
+	}
+}

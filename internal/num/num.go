@@ -26,12 +26,21 @@ func CeilPow2(n int) int {
 	return 1 << bits.Len(uint(n-1))
 }
 
-// Shards returns the shard count for a table of capacity entries: n, or
-// a multiple of procs when n is zero, rounded up to a power of two and
-// lowered so that each shard holds at least one entry.
+// MinShardSize is the number of entries per shard below which a default
+// shard count is lowered: full-table policies act per shard, so small
+// shards would make a table behave as full long before it holds its
+// capacity.
+const MinShardSize = 256
+
+// Shards returns the shard count for a table of capacity entries. An
+// explicit n is rounded up to a power of two and lowered so that each
+// shard holds at least one entry. When n is zero, it is a multiple of
+// procs, lowered to a power of two such that each shard holds at least
+// MinShardSize entries, and at least 1.
 func Shards(n, capacity, procs int) int {
 	if n == 0 {
-		n = 4 * procs
+		n = min(4*procs, max(1, capacity/MinShardSize))
+		return 1 << (bits.Len(uint(n)) - 1)
 	}
 	n = CeilPow2(min(n, capacity))
 	for n > 1 && n > capacity {

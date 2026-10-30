@@ -14,11 +14,13 @@
 // and Fail, Release or Succeed settles the reservation:
 //
 //	ip := ips.Attempt(prefix)
+//	if !ip.Allowed() {
+//		return tooManyAttempts(ip.RetryAfter())
+//	}
 //	user := users.Attempt(name)
-//	if !ip.Allowed() || !user.Allowed() {
-//		ip.Release() // release whichever reservation was made
-//		user.Release()
-//		return tooManyAttempts(max(ip.RetryAfter(), user.RetryAfter()))
+//	if !user.Allowed() {
+//		ip.Release()
+//		return tooManyAttempts(user.RetryAfter())
 //	}
 //	if !checkPassword(name, password) { // slow
 //		ip.Fail()
@@ -28,11 +30,20 @@
 //	ip.Release()
 //	user.Succeed()
 //
+// Reserve the cheaper, wider key first and stop when it is refused, so
+// that a banned client does not touch the other limiter at all.
+//
 // Release settles the reservation without a failure; it does not clear
 // earlier failures. Succeed also clears them, which suits a key that the
 // success proves is the caller's, such as an account name, but not an IP
 // prefix: an attacker could reset its prefix by logging into its own
 // account. IsBanned and BannedUntil are read-only and meant for display.
+//
+// Limiter.Fail and Limiter.Succeed act without a reservation. Use Fail
+// for failures found without an expensive check to guard, such as a
+// malformed or forged request, and Succeed to clear an account's failures
+// after it proved itself another way, such as by a password reset. Around
+// an expensive check, always use Attempt.
 //
 // # Counting and bans
 //
@@ -51,10 +62,18 @@
 // operation takes amortised constant time, apart from Bans, Stats, Sweep
 // and Reset, which visit every shard.
 //
-// When a shard has MaxPending counters, a new key evicts the counter updated
+// A counter lives only while its key has failures in the window,
+// attempts in flight or the offences of an evicted ban: settling an
+// attempt that leaves nothing to count frees the counter at once. When a
+// shard has MaxPending counters, a new key evicts the counter updated
 // least recently. An attacker flooding the limiter with new keys can thus
-// reset the pending counters, and reservations, of other keys, but never
-// lift a ban.
+// reset the pending counters, and reservations, of other keys, but only
+// with failures or attempts held in flight, never with attempts it
+// settles at once, and it never lifts a ban.
+//
+// Limits apply per shard: each holds MaxPending/Shards counters and
+// MaxBans/Shards records. The default shard count keeps each shard at 256
+// entries or more, so a small limiter has a single shard.
 //
 // When a shard holds MaxBans records and a key reaches Threshold, records
 // of ended bans kept only for Cooldown are dropped first. If every record
@@ -84,7 +103,9 @@
 //
 // A Limiter lives in memory. A service that wants bans to survive a
 // restart saves Bans when it stops and passes each to Ban when it starts
-// again; pending failures and the offences of ended bans are not kept.
+// again. Bans includes the records of ended bans still in their
+// cooldown, so repeat offenders keep their longer bans; pending failures
+// are not kept.
 //
 // # Clocks
 //
@@ -93,6 +114,7 @@
 package failban
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -102,6 +124,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/djylb/guard/internal/clock"
 	"github.com/djylb/guard/internal/conf"
 	"github.com/djylb/guard/internal/num"
 )
@@ -138,26 +161,48 @@ const (
 	EvictSoonest
 )
 
+var policyNames = [...]string{LockShard: "LockShard", EvictSoonest: "EvictSoonest"}
+
 // String returns the policy's name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (p FullPolicy) String() string {
-	switch p {
-	case LockShard:
-		return "LockShard"
-	case EvictSoonest:
-		return "EvictSoonest"
-	default:
-		return fmt.Sprintf("FullPolicy(%d)", int(p))
+	if p >= 0 && int(p) < len(policyNames) {
+		return policyNames[p]
 	}
+	return fmt.Sprintf("FullPolicy(%d)", int(p))
 }
 
 // ParseFullPolicy returns the policy whose String form is s, ignoring
 // case.
 func ParseFullPolicy(s string) (FullPolicy, error) {
-	i, ok := conf.ParseName(s, LockShard.String(), EvictSoonest.String())
+	i, ok := conf.ParseName(s, policyNames[:]...)
 	if !ok {
 		return 0, fmt.Errorf("%w: unknown full policy %q", ErrInvalidConfig, s)
 	}
 	return FullPolicy(i), nil
+}
+
+// MarshalText implements encoding.TextMarshaler with the String form; an
+// unknown policy is an error.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (p FullPolicy) MarshalText() ([]byte, error) {
+	if p < 0 || int(p) >= len(policyNames) {
+		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidConfig, p)
+	}
+	return []byte(policyNames[p]), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler with ParseFullPolicy.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (p *FullPolicy) UnmarshalText(text []byte) error {
+	v, err := ParseFullPolicy(string(text))
+	if err == nil {
+		*p = v
+	}
+	return err
 }
 
 const buckets = 8 // per counter; a power of two
@@ -172,7 +217,8 @@ type Config struct {
 	Now func() time.Time
 	// Threshold is the number of failures within Window that bans a
 	// key, and the number of attempts that may be in flight or failed
-	// at once. It defaults to DefaultThreshold.
+	// at once. It defaults to DefaultThreshold and must fit in a uint32,
+	// the size of the failure counts.
 	Threshold int
 	// Window is the period over which failures are counted. It
 	// defaults to DefaultWindow.
@@ -196,11 +242,41 @@ type Config struct {
 	MaxBans int
 	// Shards is the number of independently locked shards, rounded up
 	// to a power of two and lowered so that each shard holds at least
-	// one counter and one ban. It defaults to a multiple of GOMAXPROCS.
+	// one counter and one ban. It defaults to a multiple of GOMAXPROCS,
+	// lowered so that each shard holds at least 256 counters and bans.
+	// MaxPending, MaxBans and Full apply per shard.
 	Shards int
 	// Full is the policy for a full ban table. It defaults to
 	// LockShard.
 	Full FullPolicy
+}
+
+// jsonConfig is the JSON form of a Config.
+type jsonConfig struct {
+	Threshold      int           `json:"threshold"`
+	Window         conf.Duration `json:"window"`
+	BanDuration    conf.Duration `json:"ban_duration"`
+	MaxBanDuration conf.Duration `json:"max_ban_duration"`
+	Cooldown       conf.Duration `json:"cooldown"`
+	MaxPending     int           `json:"max_pending"`
+	MaxBans        int           `json:"max_bans"`
+	Shards         int           `json:"shards"`
+	Full           FullPolicy    `json:"full"`
+}
+
+//goland:noinspection GoMixedReceiverTypes
+func (c *Config) json() jsonConfig {
+	return jsonConfig{
+		Threshold:      c.Threshold,
+		Window:         conf.Duration(c.Window),
+		BanDuration:    conf.Duration(c.BanDuration),
+		MaxBanDuration: conf.Duration(c.MaxBanDuration),
+		Cooldown:       conf.Duration(c.Cooldown),
+		MaxPending:     c.MaxPending,
+		MaxBans:        c.MaxBans,
+		Shards:         c.Shards,
+		Full:           c.Full,
+	}
 }
 
 // UnmarshalJSON reads a Config from a JSON object such as
@@ -210,44 +286,44 @@ type Config struct {
 // with the fields threshold, window, ban_duration, max_ban_duration,
 // cooldown, max_pending, max_bans, shards and full. Durations are strings
 // in the form of time.ParseDuration; the policy is a name as its String
-// method returns it. Fields that are absent keep their value; unknown
-// fields are an error. Now cannot be set from JSON.
+// method returns it. Fields that are absent keep their value; unknown,
+// repeated and null fields are an error, and names must match exactly.
+// Now cannot be set from JSON.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (c *Config) UnmarshalJSON(data []byte) error {
-	v := struct {
-		Full           conf.Enum[FullPolicy] `json:"full"`
-		Window         conf.Duration         `json:"window"`
-		BanDuration    conf.Duration         `json:"ban_duration"`
-		MaxBanDuration conf.Duration         `json:"max_ban_duration"`
-		Cooldown       conf.Duration         `json:"cooldown"`
-		Threshold      int                   `json:"threshold"`
-		MaxPending     int                   `json:"max_pending"`
-		MaxBans        int                   `json:"max_bans"`
-		Shards         int                   `json:"shards"`
-	}{
-		Full:           conf.Enum[FullPolicy]{Parse: ParseFullPolicy, Value: c.Full},
-		Window:         conf.Duration(c.Window),
-		BanDuration:    conf.Duration(c.BanDuration),
-		MaxBanDuration: conf.Duration(c.MaxBanDuration),
-		Cooldown:       conf.Duration(c.Cooldown),
-		Threshold:      c.Threshold,
-		MaxPending:     c.MaxPending,
-		MaxBans:        c.MaxBans,
-		Shards:         c.Shards,
-	}
+	v := c.json()
 	if err := conf.Decode(data, &v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	c.Full, c.Window, c.Cooldown = v.Full.Value, time.Duration(v.Window), time.Duration(v.Cooldown)
-	c.BanDuration, c.MaxBanDuration = time.Duration(v.BanDuration), time.Duration(v.MaxBanDuration)
-	c.Threshold, c.MaxPending, c.MaxBans, c.Shards = v.Threshold, v.MaxPending, v.MaxBans, v.Shards
+	*c = Config{
+		Now:            c.Now,
+		Threshold:      v.Threshold,
+		Window:         time.Duration(v.Window),
+		BanDuration:    time.Duration(v.BanDuration),
+		MaxBanDuration: time.Duration(v.MaxBanDuration),
+		Cooldown:       time.Duration(v.Cooldown),
+		MaxPending:     v.MaxPending,
+		MaxBans:        v.MaxBans,
+		Shards:         v.Shards,
+		Full:           v.Full,
+	}
 	return nil
 }
 
-// Ban describes an active ban, as Bans lists them and Ban takes them.
+// MarshalJSON writes c in the form UnmarshalJSON reads, without Now.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c Config) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.json())
+}
+
+// Ban is a ban record, as Bans lists them and Ban takes them: an active
+// ban, or one that ended and whose offences are remembered for Cooldown.
 type Ban[K comparable] struct {
 	// Key is the banned key.
 	Key K
-	// Until is when the ban ends.
+	// Until is when the ban ends, or ended.
 	Until time.Time
 	// Offences is the number of bans of this key in a row, counting
 	// this one.
@@ -304,9 +380,7 @@ type Stats struct {
 // K must be a type whose values can be map keys without panicking; an
 // interface type holding an uncomparable value panics, as in a map.
 type Limiter[K comparable] struct {
-	now       func() time.Time
-	base      time.Time // the clock at New, with its monotonic reading
-	wall      time.Time // base without its monotonic reading
+	clock     clock.Clock
 	shards    []shard[K]
 	seed      maphash.Seed
 	width     int64 // nanoseconds per bucket
@@ -322,7 +396,6 @@ type counter[K comparable] struct {
 	key        K
 	prev, next *counter[K] // recency list, without waiting counters; the shard's root is the sentinel
 	slots      []slot      // reservations; in use or on the free list
-	epoch      uint64      // counts removals, as the object may be reused
 	newest     int64       // bucket index of the newest bucket
 	inflight   uint64      // slots in use
 	offences   int         // of a ban EvictSoonest ended early
@@ -333,7 +406,8 @@ type counter[K comparable] struct {
 }
 
 // slot identifies one reservation, so that an Attempt settles it at most
-// once even if the Attempt was copied: settling bumps the generation.
+// once even if the Attempt was copied: settling bumps the generation,
+// which only grows, also when the counter is reused.
 type slot struct {
 	gen  uint64
 	next int // free list link, as counter.free
@@ -370,20 +444,6 @@ func (c *counter[K]) release(i int, gen uint64) bool {
 	c.free = i + 1
 	c.inflight--
 	return true
-}
-
-// invalidate ends every reservation of c, so that none can be settled.
-func (c *counter[K]) invalidate() {
-	c.free = 0
-	for i := len(c.slots) - 1; i >= 0; i-- {
-		sl := &c.slots[i]
-		if sl.used {
-			sl.gen++
-		}
-		sl.used, sl.next = false, c.free
-		c.free = i + 1
-	}
-	c.inflight = 0
 }
 
 type record[K comparable] struct {
@@ -423,6 +483,9 @@ func New[K comparable](c Config) (*Limiter[K], error) {
 		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidConfig, c.Full)
 	}
 	threshold := orDefault(c.Threshold, DefaultThreshold)
+	if uint64(threshold) > math.MaxUint32 {
+		return nil, fmt.Errorf("%w: Threshold %d exceeds the failure counts", ErrInvalidConfig, threshold)
+	}
 	window := orDefault(c.Window, DefaultWindow)
 	ban := orDefault(c.BanDuration, DefaultBanDuration)
 	maxBan := orDefault(c.MaxBanDuration, ban)
@@ -436,15 +499,8 @@ func New[K comparable](c Config) (*Limiter[K], error) {
 	capacity := orDefault(c.MaxPending, DefaultMaxPending)
 	maxBans := orDefault(c.MaxBans, DefaultMaxBans)
 	n := num.Shards(c.Shards, min(capacity, maxBans), runtime.GOMAXPROCS(0))
-	now := c.Now
-	if now == nil {
-		now = time.Now
-	}
-	base := now()
 	l := &Limiter[K]{
-		now:       now,
-		base:      base,
-		wall:      base.Round(0),
+		clock:     clock.New(c.Now),
 		shards:    make([]shard[K], n),
 		seed:      maphash.MakeSeed(),
 		width:     bucketWidth(window),
@@ -477,11 +533,11 @@ func (l *Limiter[K]) ready() bool {
 	return l != nil && l.shards != nil
 }
 
-// clock returns the current time in nanoseconds since New and the shard
+// read returns the current time in nanoseconds since New and the shard
 // of key. It runs before any lock is taken, so a Now that blocks or calls
 // back into the Limiter cannot deadlock it.
-func (l *Limiter[K]) clock(key K) (int64, *shard[K]) {
-	t := l.mono()
+func (l *Limiter[K]) read(key K) (int64, *shard[K]) {
+	t := l.clock.Mono()
 	return t, l.shard(key)
 }
 
@@ -489,12 +545,8 @@ func (l *Limiter[K]) shard(key K) *shard[K] {
 	return &l.shards[maphash.Comparable(l.seed, key)&l.mask]
 }
 
-func (l *Limiter[K]) mono() int64 {
-	return int64(l.now().Sub(l.base))
-}
-
 func (l *Limiter[K]) at(t int64) time.Time {
-	return l.wall.Add(time.Duration(t))
+	return l.clock.At(t)
 }
 
 func (l *Limiter[K]) bucket(t int64) int64 {
@@ -516,11 +568,9 @@ type Attempt[K comparable] struct {
 	c       *counter[K]
 	key     K
 	gen     uint64        // of the reservation's slot
-	epoch   uint64        // of c when reserved
 	slot    int           // in c.slots
 	retry   time.Duration // of a refused attempt, from the time of refusal
 	allowed bool
-	done    bool
 }
 
 // Attempt reserves an attempt for key, such as a password check. The
@@ -532,7 +582,7 @@ func (l *Limiter[K]) Attempt(key K) Attempt[K] {
 	if !l.ready() {
 		return a
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep(l, t)
@@ -548,7 +598,6 @@ func (l *Limiter[K]) Attempt(key K) Attempt[K] {
 		return a
 	}
 	a.slot, a.gen = a.c.reserve()
-	a.epoch = a.c.epoch
 	a.allowed = true
 	return a
 }
@@ -576,7 +625,7 @@ func (s *shard[K]) refusal(l *Limiter[K], key K, t int64) (until int64, refused 
 }
 
 // Allowed reports whether the attempt may proceed.
-func (a *Attempt[K]) Allowed() bool {
+func (a Attempt[K]) Allowed() bool {
 	return a.allowed
 }
 
@@ -586,7 +635,7 @@ func (a *Attempt[K]) Allowed() bool {
 // it was refused, and at least a second, also when it was refused because
 // the key's attempts were all in flight. It returns zero for an allowed
 // attempt.
-func (a *Attempt[K]) RetryAfter() time.Duration {
+func (a Attempt[K]) RetryAfter() time.Duration {
 	if a.allowed {
 		return 0
 	}
@@ -601,20 +650,20 @@ func (a *Attempt[K]) RetryAfter() time.Duration {
 // successful check of a key that the success does not prove is the
 // caller's, or an attempt that was aborted. It leaves the key's earlier
 // failures alone.
-func (a *Attempt[K]) Release() {
+func (a Attempt[K]) Release() {
 	a.settle(release)
 }
 
 // Succeed settles an allowed attempt as a success and clears the key's
 // pending failures, as Limiter.Succeed does.
-func (a *Attempt[K]) Succeed() {
+func (a Attempt[K]) Succeed() {
 	a.settle(succeed)
 }
 
 // Fail settles an allowed attempt as a failure, as Limiter.Fail does, and
 // returns the key's state afterwards. On an attempt that was not allowed,
 // or was already settled, it does nothing and returns the zero Result.
-func (a *Attempt[K]) Fail() Result {
+func (a Attempt[K]) Fail() Result {
 	return a.settle(fail)
 }
 
@@ -626,19 +675,19 @@ const (
 	fail
 )
 
-func (a *Attempt[K]) settle(o outcome) Result {
-	if !a.allowed || a.done {
+func (a Attempt[K]) settle(o outcome) Result {
+	if !a.allowed {
 		return Result{}
 	}
-	a.done = true
 	l := a.l
-	t, s := l.clock(a.key)
+	t, s := l.read(a.key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// The counter may be gone, evicted or reset meanwhile: then the
-	// reservation went with it. A copy of a settled Attempt finds its
-	// slot released and does nothing.
-	if a.c.epoch == a.epoch && !a.c.release(a.slot, a.gen) {
+	// Only an unsettled reservation settles: its counter, also one that
+	// was evicted or reset meanwhile, still holds its slot in the same
+	// generation. A copy of a settled Attempt finds the generation
+	// advanced, also once the counter is reused, and does nothing.
+	if !a.c.release(a.slot, a.gen) {
 		return Result{}
 	}
 	s.sweep(l, t)
@@ -648,6 +697,11 @@ func (a *Attempt[K]) settle(o outcome) Result {
 		s.clear(a.key)
 	case fail:
 		return s.fail(l, a.key, t)
+	}
+	// Free a counter that holds nothing any more, so that attempts
+	// settled at once never push out the counters of other keys.
+	if c := s.counters[a.key]; c != nil && !c.waiting && c.idle(l.bucket(t)) {
+		s.removeCounter(c)
 	}
 	return Result{}
 }
@@ -660,7 +714,7 @@ func (l *Limiter[K]) Fail(key K) Result {
 	if !l.ready() {
 		return Result{Banned: true}
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep(l, t)
@@ -704,30 +758,39 @@ func (s *shard[K]) fail(l *Limiter[K], key K, t int64) Result {
 }
 
 // Ban bans b.Key until b.Until, for an administrator's ban or to restore
-// the bans that Bans returned before a restart. b.Offences, at least 1,
+// the records that Bans returned before a restart. b.Offences, at least 1,
 // is the key's number of bans in a row, so that its next ban is longer. A
 // ban of the key that ends later, or with more offences, is kept as it
-// is, and a ban that has already ended is ignored. When the shard's ban
-// table is full of active bans, Full decides: EvictSoonest makes room and
-// LockShard returns ErrFull. The zero Limiter returns ErrUninitialized.
+// is. A ban that has already ended is restored as a record in cooldown,
+// which only makes the key's next ban longer, unless its cooldown has
+// ended too, or the shard's ban table is full of active bans: then it is
+// ignored. A ban in force drops the key's pending failures and attempts
+// in flight; a record in cooldown leaves them alone. When the shard's ban
+// table is full of active bans, Full decides for a ban in force:
+// EvictSoonest makes room and LockShard returns ErrFull. The zero Limiter
+// returns ErrUninitialized.
 func (l *Limiter[K]) Ban(b Ban[K]) error {
 	if !l.ready() {
 		return ErrUninitialized
 	}
-	now := l.now()
-	t := int64(now.Sub(l.base))
+	now, t := l.clock.Read()
 	s := l.shard(b.Key)
 	// The ban may come from another process, so its end is wall time.
-	d := b.Until.Round(0).Sub(now.Round(0))
-	if d <= 0 {
+	d := int64(b.Until.Round(0).Sub(now.Round(0)))
+	if num.SatAdd(d, l.cooldown) <= 0 {
 		return nil
 	}
-	until := num.SatAdd(t, int64(d))
+	until := num.SatAdd(t, d)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep(l, t)
 	r := s.bans[b.Key]
+	active := until > t
 	if r == nil {
+		// A record in cooldown is not worth an active ban.
+		if !active && len(s.bans) >= s.maxBans && s.heap[0].until > t {
+			return nil
+		}
 		if !s.room(l, t) {
 			return ErrFull
 		}
@@ -735,13 +798,15 @@ func (l *Limiter[K]) Ban(b Ban[K]) error {
 		s.bans[b.Key] = r
 		s.heap = append(s.heap, r)
 	}
-	if r.until <= t {
+	if r.until <= t && active {
 		s.started++
 	}
 	r.until = max(r.until, until)
 	r.offences = max(r.offences, b.Offences, 1)
 	s.fix(r.index)
-	if c := s.counters[b.Key]; c != nil {
+	// A ban in force drops the key's pending failures; a record in
+	// cooldown only lengthens its next ban and leaves them alone.
+	if c := s.counters[b.Key]; c != nil && r.until > t {
 		s.removeCounter(c)
 	}
 	return nil
@@ -866,7 +931,7 @@ func (l *Limiter[K]) Succeed(key K) {
 	if !l.ready() {
 		return
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep(l, t)
@@ -899,32 +964,45 @@ func (l *Limiter[K]) BannedUntil(key K) (until time.Time, banned bool) {
 	if !l.ready() {
 		return time.Time{}, true
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	end, ok := s.bannedUntil(l, key, t)
+	if !ok {
+		return time.Time{}, false
+	}
+	return l.at(end), true
+}
+
+// bannedUntil reports whether key is banned at t and until when.
+func (s *shard[K]) bannedUntil(l *Limiter[K], key K, t int64) (int64, bool) {
 	if r := s.bans[key]; r != nil && r.until > t {
-		return l.at(r.until), true
+		return r.until, true
 	}
 	if t < s.lockedUntil {
-		return l.at(s.lockedUntil), true
+		return s.lockedUntil, true
 	}
 	if c := s.counters[key]; c != nil && c.waiting {
 		// Its ban starts when a record frees up.
-		return l.at(num.SatAdd(t, l.ban)), true
+		return num.SatAdd(t, l.ban), true
 	}
-	return time.Time{}, false
+	return 0, false
 }
 
 // Failures returns the number of key's failures counted in the current
-// window, without attempts in flight. It is zero while key is banned. It
-// never changes the Limiter.
+// window, without attempts in flight. It is zero while BannedUntil
+// reports key banned, also by a lockdown or while it waits for a ban
+// record. It never changes the Limiter.
 func (l *Limiter[K]) Failures(key K) int {
 	if !l.ready() {
 		return 0
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if _, banned := s.bannedUntil(l, key, t); banned {
+		return 0
+	}
 	if c := s.counters[key]; c != nil {
 		return int(min(c.count(l.bucket(t)), math.MaxInt32))
 	}
@@ -937,7 +1015,7 @@ func (l *Limiter[K]) Unban(key K) bool {
 	if !l.ready() {
 		return false
 	}
-	t, s := l.clock(key)
+	t, s := l.read(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	found := false
@@ -983,7 +1061,7 @@ func (l *Limiter[K]) Sweep() {
 	if !l.ready() {
 		return
 	}
-	t := l.mono()
+	t := l.clock.Mono()
 	for i := range l.shards {
 		s := &l.shards[i]
 		s.mu.Lock()
@@ -992,18 +1070,21 @@ func (l *Limiter[K]) Sweep() {
 	}
 }
 
-// Bans returns the active bans, ordered by the time they end.
+// Bans returns the ban records, ordered by the time they end: the
+// active bans, which end after now, and the ended bans whose offences are
+// remembered for Cooldown. Pass each to Ban to restore them, such as
+// after a restart.
 func (l *Limiter[K]) Bans() []Ban[K] {
 	if !l.ready() {
 		return nil
 	}
-	t := l.mono()
+	t := l.clock.Mono()
 	var list []Ban[K]
 	for i := range l.shards {
 		s := &l.shards[i]
 		s.mu.RLock()
 		for _, r := range s.heap {
-			if r.until > t {
+			if num.SatAdd(r.until, l.cooldown) > t {
 				list = append(list, Ban[K]{Key: r.key, Until: l.at(r.until), Offences: r.offences})
 			}
 		}
@@ -1019,7 +1100,7 @@ func (l *Limiter[K]) Stats() Stats {
 	if !l.ready() {
 		return st
 	}
-	t := l.mono()
+	t := l.clock.Mono()
 	for i := range l.shards {
 		s := &l.shards[i]
 		s.mu.RLock()
@@ -1104,11 +1185,16 @@ func (s *shard[K]) removeCounter(c *counter[K]) {
 	}
 	c.waiting = false
 	delete(s.counters, c.key)
-	c.invalidate()
-	c.epoch++
-	// A counter that s.waiting may point to is never reused.
+	if c.inflight > 0 {
+		// Its reservations outlive it, so it is never reused: each
+		// still settles once, against the key's current state.
+		return
+	}
+	// Attempts made on c are all settled. Reuse keeps the slots, whose
+	// generations only grow, so that copies of those Attempts stay
+	// settled. A counter that s.waiting may point to is never reused.
 	if !c.queued && len(s.spare) < maxSpare {
-		*c = counter[K]{slots: c.slots, free: c.free, epoch: c.epoch}
+		*c = counter[K]{slots: c.slots, free: c.free}
 		s.spare = append(s.spare, c)
 	}
 }

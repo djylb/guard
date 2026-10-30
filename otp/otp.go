@@ -39,7 +39,7 @@
 //
 // # Guessing
 //
-// A six-digit code is guessed with probability 2·Skew+1 in a million per
+// A six-digit code is guessed with probability 2·SkewSteps+1 in a million per
 // try. Limit tries per account and per client, for example with a
 // failban.Limiter, and answer every rejected code alike: telling
 // ErrCodeReused from ErrCodeMismatch confirms to an attacker that a
@@ -57,6 +57,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/djylb/guard/internal/conf"
 )
 
 // Errors returned by this package.
@@ -97,6 +99,8 @@ const (
 )
 
 // String returns the algorithm's name as written in otpauth URIs.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (a Algorithm) String() string {
 	switch a {
 	case SHA1:
@@ -113,16 +117,39 @@ func (a Algorithm) String() string {
 // ParseAlgorithm returns the algorithm whose String form is s, ignoring
 // case.
 func ParseAlgorithm(s string) (Algorithm, error) {
-	for _, a := range [...]Algorithm{SHA1, SHA256, SHA512} {
-		if equalFold(s, a.String()) {
-			return a, nil
-		}
+	i, ok := conf.ParseName(s, SHA1.String(), SHA256.String(), SHA512.String())
+	if !ok {
+		return 0, fmt.Errorf("%w: unknown algorithm %q", ErrInvalidKey, s)
 	}
-	return 0, fmt.Errorf("%w: unknown algorithm %q", ErrInvalidKey, s)
+	return Algorithm(i), nil
+}
+
+// MarshalText implements encoding.TextMarshaler with the String form; an
+// unknown algorithm is an error.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (a Algorithm) MarshalText() ([]byte, error) {
+	if b, _ := a.sizes(); b == 0 {
+		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidKey, a)
+	}
+	return []byte(a.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler with ParseAlgorithm.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (a *Algorithm) UnmarshalText(text []byte) error {
+	v, err := ParseAlgorithm(string(text))
+	if err == nil {
+		*a = v
+	}
+	return err
 }
 
 // sizes returns the block and digest size of the algorithm's hash, or
 // zeros for an unknown algorithm.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (a Algorithm) sizes() (block, digest int) {
 	switch a {
 	case SHA1:
@@ -137,6 +164,8 @@ func (a Algorithm) sizes() (block, digest int) {
 }
 
 // sum hashes b into out and returns the digest.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (a Algorithm) sum(out *[sha512.Size]byte, b []byte) []byte {
 	switch a {
 	case SHA1:
@@ -164,6 +193,8 @@ const (
 )
 
 // String returns the kind's name as written in otpauth URIs.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k Kind) String() string {
 	switch k {
 	case TOTP:
@@ -173,6 +204,37 @@ func (k Kind) String() string {
 	default:
 		return fmt.Sprintf("Kind(%d)", int(k))
 	}
+}
+
+// ParseKind returns the kind whose String form is s, ignoring case.
+func ParseKind(s string) (Kind, error) {
+	i, ok := conf.ParseName(s, TOTP.String(), HOTP.String())
+	if !ok {
+		return 0, fmt.Errorf("%w: unknown kind %q", ErrInvalidKey, s)
+	}
+	return Kind(i), nil
+}
+
+// MarshalText implements encoding.TextMarshaler with the String form; an
+// unknown kind is an error.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (k Kind) MarshalText() ([]byte, error) {
+	if k != TOTP && k != HOTP {
+		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidKey, k)
+	}
+	return []byte(k.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler with ParseKind.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (k *Kind) UnmarshalText(text []byte) error {
+	v, err := ParseKind(string(text))
+	if err == nil {
+		*k = v
+	}
+	return err
 }
 
 // Limits and defaults.
@@ -199,6 +261,10 @@ const (
 // Key is a one-time password secret with its parameters. Zero Digits and
 // Period select the defaults. A Key is safe for concurrent use as long as
 // it is not modified.
+//
+// A Key is stored with its account, in the JSON form of MarshalJSON, or
+// as its URI when the parameters that a URI leaves out, SkewSteps and
+// AllowShortSecret, are fixed by the service.
 type Key struct {
 	// Issuer names the service, shown by authenticator apps.
 	Issuer string
@@ -212,14 +278,14 @@ type Key struct {
 	// Digits is the code length, from MinDigits to MaxDigits. It
 	// defaults to DefaultDigits.
 	Digits int
-	// Skew is the number of time steps before and after the current
-	// one that Verify also accepts, to tolerate clock drift and typing
-	// time; 1 is common. For VerifyCounter it is the number of counters
-	// after the expected one that are accepted, to resynchronise a
-	// token whose button was pressed without logging in. Each extra
+	// SkewSteps is the number of time steps before and after the
+	// current one that Verify also accepts, to tolerate clock drift and
+	// typing time; 1 is common. For VerifyCounter it is the number of
+	// counters after the expected one that are accepted, to resynchronise
+	// a token whose button was pressed without logging in. Each extra
 	// step costs an HMAC per verification and raises the chance that a
 	// guess matches, so keep it small.
-	Skew uint
+	SkewSteps uint
 	// Counter is the initial HOTP counter of an otpauth URI.
 	Counter uint64
 	// Algorithm is the HMAC hash function. It defaults to SHA1.
@@ -229,7 +295,9 @@ type Key struct {
 	// secrets. Re-enrol such accounts when possible. ParseURI never sets
 	// it: for such a URI, build the Key from DecodeSecret.
 	AllowShortSecret bool
-	// Kind is the URI type: TOTP or HOTP. It only affects URI.
+	// Kind is the type of the Key: TOTP keys work with Code and Verify,
+	// HOTP keys with CounterCode and VerifyCounter; the others return
+	// ErrInvalidKey. It is also the type of the URI.
 	Kind Kind
 }
 
@@ -244,10 +312,29 @@ func GenerateSecret(size int) ([]byte, error) {
 	return b, nil
 }
 
+// errKind reports a Key used with the methods of the other Kind.
+var errKind = fmt.Errorf("%w: wrong kind for this method", ErrInvalidKey)
+
+// paramsOf is params for a method of kind.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (k *Key) paramsOf(kind Kind) (digits int, period uint64, err error) {
+	digits, period, err = k.params()
+	if err == nil && k.Kind != kind {
+		err = errKind
+	}
+	return digits, period, err
+}
+
 // params validates k and returns its effective digits and period.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) params() (digits int, period uint64, err error) {
 	if k == nil {
 		return 0, 0, fmt.Errorf("%w: nil key", ErrInvalidKey)
+	}
+	if k.Kind != TOTP && k.Kind != HOTP {
+		return 0, 0, fmt.Errorf("%w: unknown %v", ErrInvalidKey, k.Kind)
 	}
 	minSize := MinSecretSize
 	if k.AllowShortSecret {
@@ -277,14 +364,18 @@ func (k *Key) params() (digits int, period uint64, err error) {
 }
 
 // Validate reports whether k's parameters can be used.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) Validate() error {
 	_, _, err := k.params()
 	return err
 }
 
 // Step returns the TOTP time step that contains t.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) Step(t time.Time) (uint64, error) {
-	_, period, err := k.params()
+	_, period, err := k.paramsOf(TOTP)
 	if err != nil {
 		return 0, err
 	}
@@ -300,8 +391,10 @@ func step(t time.Time, period uint64) (uint64, error) {
 }
 
 // Code returns the TOTP code for time t.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) Code(t time.Time) (string, error) {
-	digits, period, err := k.params()
+	digits, period, err := k.paramsOf(TOTP)
 	if err != nil {
 		return "", err
 	}
@@ -315,8 +408,10 @@ func (k *Key) Code(t time.Time) (string, error) {
 }
 
 // CounterCode returns the HOTP code for counter.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) CounterCode(counter uint64) (string, error) {
-	digits, _, err := k.params()
+	digits, _, err := k.paramsOf(HOTP)
 	if err != nil {
 		return "", err
 	}
@@ -326,7 +421,7 @@ func (k *Key) CounterCode(counter uint64) (string, error) {
 }
 
 // Verify checks a TOTP code at time t. It accepts the code of the current
-// time step and of Skew steps on either side, but none below next, the
+// time step and of SkewSteps steps on either side, but none below next, the
 // value Verify returned for the account's previous successful code (0 for
 // a fresh account). On success it returns the value to store as the
 // account's next acceptable step.
@@ -334,8 +429,10 @@ func (k *Key) CounterCode(counter uint64) (string, error) {
 // A correct code for a step below next returns ErrCodeReused, or
 // ErrStepAhead if next lies beyond every step the clock allows. If a code
 // matches several steps by chance, the latest acceptable one is used.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) Verify(code string, t time.Time, next uint64) (uint64, error) {
-	digits, period, err := k.params()
+	digits, period, err := k.paramsOf(TOTP)
 	if err != nil {
 		return next, err
 	}
@@ -346,8 +443,8 @@ func (k *Key) Verify(code string, t time.Time, next uint64) (uint64, error) {
 	if err != nil {
 		return next, err
 	}
-	lo := cur - min(cur, uint64(k.Skew))
-	hi := cur + min(math.MaxUint64-1-cur, uint64(k.Skew)) // cur < MaxUint64
+	lo := cur - min(cur, uint64(k.SkewSteps))
+	hi := cur + min(math.MaxUint64-1-cur, uint64(k.SkewSteps)) // cur < MaxUint64
 	next, err = k.verify(code, digits, lo, hi, next)
 	if errors.Is(err, ErrCodeReused) && next > hi+1 {
 		// No code at all could be accepted now: a legitimate login
@@ -357,12 +454,14 @@ func (k *Key) Verify(code string, t time.Time, next uint64) (uint64, error) {
 	return next, err
 }
 
-// VerifyCounter checks an HOTP code against counters next to next+Skew,
+// VerifyCounter checks an HOTP code against counters next to next+SkewSteps,
 // where next is the value VerifyCounter returned for the token's previous
 // successful code, or the initial counter. On success it returns the value
 // to store as the token's next counter.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) VerifyCounter(code string, next uint64) (uint64, error) {
-	digits, _, err := k.params()
+	digits, _, err := k.paramsOf(HOTP)
 	if err != nil {
 		return next, err
 	}
@@ -374,12 +473,14 @@ func (k *Key) VerifyCounter(code string, next uint64) (uint64, error) {
 	if next == math.MaxUint64 {
 		return next, ErrCodeMismatch
 	}
-	hi := next + min(math.MaxUint64-1-next, uint64(k.Skew))
+	hi := next + min(math.MaxUint64-1-next, uint64(k.SkewSteps))
 	return k.verify(code, digits, next, hi, next)
 }
 
 // verify compares code with the codes of steps lo to hi, all of them, in
 // constant time per step.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) verify(code string, digits int, lo, hi, next uint64) (uint64, error) {
 	var g generator
 	g.init(k, digits)
@@ -427,26 +528,6 @@ func equalCode(got []byte, code string) bool {
 		v |= got[i] ^ code[i]
 	}
 	return subtle.ConstantTimeByteEq(v, 0) == 1
-}
-
-// equalFold reports whether s and t are equal ignoring ASCII case.
-func equalFold(s, t string) bool {
-	if len(s) != len(t) {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		a, b := s[i], t[i]
-		if 'a' <= a && a <= 'z' {
-			a -= 'a' - 'A'
-		}
-		if 'a' <= b && b <= 'z' {
-			b -= 'a' - 'A'
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
 }
 
 var pow10 = [MaxDigits + 1]uint64{1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10}

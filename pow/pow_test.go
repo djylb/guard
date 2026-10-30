@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/guard/internal/race"
 	"github.com/djylb/guard/replay"
 )
 
@@ -171,7 +173,7 @@ func TestTamper(t *testing.T) {
 		for _, bit := range []byte{0x01, 0x80} {
 			mod := raw
 			mod[i] ^= bit
-			tok := enc.EncodeToString(mod[:])
+			tok := base64.RawURLEncoding.EncodeToString(mod[:])
 			s := uint64(0)
 			if _, ch, err := decode(tok); err == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -200,13 +202,13 @@ func TestMalformed(t *testing.T) {
 	}
 	v2 := raw
 	v2[0] = 2
-	bad[enc.EncodeToString(v2[:])] = ErrVersion
+	bad[base64.RawURLEncoding.EncodeToString(v2[:])] = ErrVersion
 	d0 := raw
 	d0[1] = 0
-	bad[enc.EncodeToString(d0[:])] = ErrMalformed
+	bad[base64.RawURLEncoding.EncodeToString(d0[:])] = ErrMalformed
 	big := raw
 	big[2] = 0x80
-	bad[enc.EncodeToString(big[:])] = ErrMalformed
+	bad[base64.RawURLEncoding.EncodeToString(big[:])] = ErrMalformed
 	// A non-canonical final character decodes to the same bytes in a
 	// lenient decoder; the strict one rejects it.
 	last := token[TokenLen-1]
@@ -494,7 +496,7 @@ func BenchmarkSolve16(b *testing.B) {
 // authentic recomputes a token's MAC, for a single binding field,
 // independently of the signer.
 func authentic(token string, binding string) bool {
-	raw, err := enc.DecodeString(token)
+	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(raw) != rawLen {
 		return false
 	}
@@ -610,7 +612,7 @@ func mustParse(t testing.TB, token string) Challenge {
 }
 
 func TestVerifyAllocs(t *testing.T) {
-	if raceEnabled {
+	if race.Enabled() {
 		t.Skip("sync.Pool drops items in race builds")
 	}
 	clk := newFakeClock()
@@ -688,5 +690,74 @@ func TestWallClockStepBack(t *testing.T) {
 	clk.Advance(-(time.Minute + DefaultSkew))
 	if err := c.Verify(tok, s, "ip"); err == nil {
 		t.Fatal("replay accepted after the wall clock stepped back")
+	}
+}
+
+func TestNilMemoryStore(t *testing.T) {
+	var m *MemoryStore
+	if _, err := New(Config{Key: testKey, Store: m}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("typed nil MemoryStore: %v", err)
+	}
+	if _, err := New(Config{Key: testKey, Store: &MemoryStore{}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("zero MemoryStore: %v", err)
+	}
+	if st := m.Stats(); st != (replay.Stats{}) {
+		t.Fatal(st)
+	}
+	if fresh, err := m.MarkUsed(ID{}, time.Now()); fresh || err == nil {
+		t.Fatal("nil MemoryStore marked an id")
+	}
+	if fresh, err := (&MemoryStore{}).MarkUsed(ID{}, time.Now()); fresh || err == nil {
+		t.Fatal("zero MemoryStore marked an id")
+	}
+}
+
+// TestStoreFull checks that a full RejectNew store rejects without
+// allocating, and that Stats shows the default store.
+func TestStoreFull(t *testing.T) {
+	clk := newFakeClock()
+	m, err := NewMemoryStore(replay.Config{Now: clk.Now, Window: time.Minute, Skew: DefaultSkew, Capacity: 1, Full: replay.RejectNew})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := mustNew(t, Config{Now: clk.Now, Key: testKey, Difficulty: 1, TTL: time.Minute, Store: m})
+	first, _ := c.Issue()
+	if err := c.Verify(first, solve(t, first)); err != nil {
+		t.Fatal(err)
+	}
+	token, _ := c.Issue()
+	s := solve(t, token)
+	if err := c.Verify(token, s); !errors.Is(err, ErrStore) || !errors.Is(err, replay.ErrFull) {
+		t.Fatalf("full store: %v", err)
+	}
+	if !race.Enabled() {
+		if n := testing.AllocsPerRun(100, func() { _ = c.Verify(token, s) }); n != 0 {
+			t.Errorf("rejection by a full store allocates %v times", n)
+		}
+	}
+	if st := c.Stats(); st.Len != 1 || st.Capacity != 1 {
+		t.Fatalf("Stats = %+v", st)
+	}
+	d := mustNew(t, Config{Key: testKey})
+	if st := d.Stats(); st.Capacity != DefaultReplayCapacity {
+		t.Fatalf("default store Stats = %+v", st)
+	}
+	if st := mustNew(t, Config{Key: testKey, Store: &mapStore{}}).Stats(); st != (replay.Stats{}) {
+		t.Fatalf("custom store Stats = %+v", st)
+	}
+}
+
+func TestConfigMarshalJSON(t *testing.T) {
+	b, err := json.Marshal(Config{Key: testKey, PreviousKeys: [][]byte{testKey}, TTL: time.Minute})
+	if err != nil || strings.Contains(string(b), "key") {
+		t.Fatalf("secret written: %s, %v", b, err)
+	}
+	var c Config
+	if err := json.Unmarshal(b, &c); err == nil {
+		t.Fatal("config without a key decoded")
+	}
+	b, _ = json.Marshal(Config{TTL: time.Minute})
+	if err := json.Unmarshal(b, &c); err != nil || c.Key != nil || c.TTL != time.Minute {
+		t.Fatalf("%s: %+v, %v", b, c, err)
 	}
 }

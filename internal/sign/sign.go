@@ -2,6 +2,11 @@
 // header and length-prefixed fields, with a current key that signs and
 // previous keys that still verify, so that keys can be rotated. Signing
 // and verifying do not allocate.
+//
+// It also holds the one format of the guard packages' signed tokens: a
+// fixed-size header that ends with a random nonce, followed by the tag of
+// the header, encoded as unpadded base64url with strict decoding, so that
+// each token has a single spelling.
 package sign
 
 import (
@@ -9,6 +14,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,6 +24,23 @@ import (
 
 // Size is the length of a tag.
 const Size = sha256.Size
+
+// NonceSize is the length of the random nonce that ends a token header.
+const NonceSize = 16
+
+// MaxRaw is the largest decoded token Open accepts.
+const MaxRaw = 64
+
+var (
+	enc    = base64.RawURLEncoding
+	strict = enc.Strict()
+)
+
+// TokenLen returns the length of the token string of a raw token of n
+// bytes: header and tag.
+func TokenLen(n int) int {
+	return enc.EncodedLen(n)
+}
 
 // maxPooled is the largest message buffer kept in a pool.
 const maxPooled = 4096
@@ -111,4 +134,36 @@ func allZero(b []byte) bool {
 		acc |= x
 	}
 	return acc == 0
+}
+
+// Seal completes and encodes a raw token: raw holds the header, whose
+// last NonceSize bytes Seal fills from crypto/rand, followed by Size
+// bytes for the tag of the header and fields.
+func (s *Signer) Seal(raw []byte, fields ...string) string {
+	h := len(raw) - Size
+	_, _ = rand.Read(raw[h-NonceSize : h]) // crypto/rand.Read never fails
+	tag := s.Sign(raw[:h], fields...)
+	copy(raw[h:], tag[:])
+	return enc.EncodeToString(raw)
+}
+
+// Open decodes token into raw, which must be at most MaxRaw bytes long,
+// and reports whether token is the strict encoding of exactly len(raw)
+// bytes. It does not check the tag; see Check.
+func Open(raw []byte, token string) bool {
+	if len(raw) > MaxRaw || len(token) != enc.EncodedLen(len(raw)) {
+		return false
+	}
+	// Decode from a stack copy, so that the string does not escape.
+	var src [(MaxRaw*8 + 5) / 6]byte
+	n := copy(src[:], token)
+	got, err := strict.Decode(raw, src[:n])
+	return err == nil && got == len(raw)
+}
+
+// Check reports whether the tag at the end of raw, as Seal wrote it, is
+// the tag of the header and fields under any of the keys.
+func (s *Signer) Check(raw []byte, fields ...string) bool {
+	h := len(raw) - Size
+	return h >= 0 && s.Verify(raw[h:], raw[:h], fields...)
 }

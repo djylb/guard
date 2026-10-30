@@ -12,7 +12,7 @@ func Example() {
 	if err != nil {
 		panic(err)
 	}
-	key := &otp.Key{Issuer: "Example", Account: "alice", Secret: secret, Skew: 1}
+	key := &otp.Key{Issuer: "Example", Account: "alice", Secret: secret, SkewSteps: 1}
 	uri, err := key.URI() // show as a QR code during enrolment
 	if err != nil {
 		panic(err)

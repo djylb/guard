@@ -146,7 +146,8 @@ func TestGrowth(t *testing.T) {
 		}
 		clk.Advance(until.Sub(clk.Now()))
 	}
-	if bans := l.Bans(); len(bans) != 0 {
+	// The ended ban stays listed, in cooldown, for persistence.
+	if bans := l.Bans(); len(bans) != 1 || bans[0].Until.After(clk.Now()) || bans[0].Offences != 5 {
 		t.Fatalf("Bans = %v", bans)
 	}
 	// After the cooldown, offences are forgotten.
@@ -291,6 +292,9 @@ func TestLockShard(t *testing.T) {
 	}
 	if !l.IsBanned("c") || !l.IsBanned("innocent") {
 		t.Fatal("shard not locked down")
+	}
+	if n := l.Failures("c"); n != 0 {
+		t.Fatalf("waiting key reports %d failures, want 0 while banned", n)
 	}
 	if st := l.Stats(); st.LockedShards != 1 || st.Waiting != 1 || st.Evicted != 0 {
 		t.Fatalf("Stats = %+v", st)
@@ -501,6 +505,8 @@ func TestPrefixLen(t *testing.T) {
 		{in: "[2001:db8::1]:1", v4: 32, want: "2001:db8::1/128"},
 		{in: "192.0.2.1:1", v6: 64, want: "192.0.2.1/32"},
 		{in: "[2001:db8::1]:1", want: "2001:db8::1/128"},
+		{in: "[::1]", v6: 64, want: "::/64"},
+		{in: "[192.0.2.1]", wantErrors: true},
 		{in: "example.com:80", wantErrors: true},
 		{in: "", wantErrors: true},
 		{in: "@", wantErrors: true},
@@ -590,7 +596,7 @@ func TestBanRestore(t *testing.T) {
 		t.Fatalf("ban shortened: %+v", got)
 	}
 	if err := restored.Ban(Ban[string]{Key: "b", Until: clk.Now().Add(-time.Second)}); err != nil || restored.IsBanned("b") {
-		t.Fatalf("ended ban restored: %v", err)
+		t.Fatalf("ended ban restored as active: %v", err)
 	}
 	// A manual ban drops the key's pending failures and counts as a start.
 	restored.Fail("c")
@@ -598,7 +604,7 @@ func TestBanRestore(t *testing.T) {
 	if err := restored.Ban(Ban[string]{Key: "c", Until: clk.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	if restored.Failures("c") != 0 || restored.Stats().Started != before+1 || restored.Bans()[1].Offences != 1 {
+	if restored.Failures("c") != 0 || restored.Stats().Started != before+1 || restored.Bans()[2].Offences != 1 {
 		t.Fatalf("manual ban: %d failures, %+v, %+v", restored.Failures("c"), restored.Stats(), restored.Bans())
 	}
 }
@@ -751,5 +757,175 @@ func TestWaitingBanEscalates(t *testing.T) {
 	}
 	if r := l.Fail("a"); !r.Banned || r.Offences != 2 || r.Until.Sub(clk.Now()) != 2*time.Minute {
 		t.Fatalf("escalated after eviction: %+v", r)
+	}
+}
+
+// Records in cooldown survive a restart, so a repeat offender's next ban
+// stays longer.
+func TestBanRestoreCooling(t *testing.T) {
+	clk := newFakeClock()
+	cfg := Config{Threshold: 1, BanDuration: time.Minute, MaxBanDuration: time.Hour}
+	l := newTest(t, clk, cfg)
+	l.Fail("a")
+	clk.Advance(time.Minute)
+	l.Fail("a") // second offence: two minutes
+	clk.Advance(3 * time.Minute)
+	saved := l.Bans()
+	if len(saved) != 1 || saved[0].Offences != 2 || saved[0].Until.After(clk.Now()) {
+		t.Fatalf("Bans = %+v", saved)
+	}
+	restored := newTest(t, clk, cfg)
+	before := restored.Stats().Started
+	if err := restored.Ban(saved[0]); err != nil {
+		t.Fatal(err)
+	}
+	if restored.IsBanned("a") || restored.Stats().Started != before || restored.Stats().Cooling != 1 {
+		t.Fatalf("cooling record restored as a ban: %+v", restored.Stats())
+	}
+	if until, _ := ub(restored.Fail("a")); until.Sub(clk.Now()) != 4*time.Minute {
+		t.Fatalf("third ban lasts %v, want 4m", until.Sub(clk.Now()))
+	}
+	// A record whose cooldown ended is ignored.
+	if err := restored.Ban(Ban[string]{Key: "b", Until: clk.Now().Add(-2 * time.Hour), Offences: 3}); err != nil || restored.Stats().Cooling != 0 {
+		t.Fatalf("expired record restored: %v %+v", err, restored.Stats())
+	}
+}
+
+// Attempts that are released at once must not evict the counter of a key
+// with failures (flooding without failing).
+func TestReleaseFreesCounter(t *testing.T) {
+	clk := newFakeClock()
+	l := newTest(t, clk, Config{Threshold: 5, MaxPending: 64, Shards: 1})
+	failN(l, "alice", 4)
+	for i := range 1000 {
+		a := l.Attempt(fmt.Sprint("junk", i))
+		a.Release()
+		b := l.Attempt(fmt.Sprint("ok", i))
+		b.Succeed()
+	}
+	if n := l.Failures("alice"); n != 4 {
+		t.Fatalf("alice has %d failures after a release flood, want 4", n)
+	}
+	if st := l.Stats(); st.Pending != 1 {
+		t.Fatalf("idle counters kept: %+v", st)
+	}
+	// Attempts on fresh keys reuse counters next to a key with failures.
+	keys := [...]string{"x", "y"}
+	i := 0
+	if n := testing.AllocsPerRun(1000, func() {
+		a := l.Attempt(keys[i%2])
+		a.Release()
+		i++
+	}); n != 0 {
+		t.Errorf("Attempt+Release allocates %v times", n)
+	}
+}
+
+func TestThresholdBound(t *testing.T) {
+	limit := uint64(math.MaxUint32)
+	if limit >= math.MaxInt {
+		t.Skip("int cannot exceed the bound")
+	}
+	if _, err := New[string](Config{Threshold: int(limit + 1)}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Threshold beyond uint32 accepted: %v", err)
+	}
+	if _, err := New[string](Config{Threshold: int(limit)}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttemptValueMethods(t *testing.T) {
+	l := mustNew[string](t, Config{Threshold: 1})
+	l.Fail("x")
+	// Allowed and RetryAfter work on the returned value directly.
+	if l.Attempt("x").Allowed() || l.Attempt("x").RetryAfter() < time.Second {
+		t.Fatal("banned key allowed")
+	}
+}
+
+func TestConfigJSONRoundTrip(t *testing.T) {
+	c := Config{Threshold: 3, Window: time.Minute, BanDuration: time.Second, MaxBanDuration: time.Hour,
+		Cooldown: 2 * time.Hour, MaxPending: 10, MaxBans: 20, Shards: 2, Full: EvictSoonest}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Config
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	got.Now = nil
+	if fmt.Sprint(got) != fmt.Sprint(c) {
+		t.Fatalf("%s -> %+v", b, got)
+	}
+	if b, err := json.Marshal(struct{ P PrefixLen }{PrefixLen{V4: 24, V6: 48}}); err != nil || string(b) != `{"P":{"v4":24,"v6":48}}` {
+		t.Fatalf("PrefixLen JSON %s, %v", b, err)
+	}
+}
+
+// TestAttemptCopyAfterReclaim is a regression test: settling an Attempt
+// reclaims its idle counter, and a copy settled afterwards must neither
+// count a failure, clear later failures, nor free a later reservation.
+func TestAttemptCopyAfterReclaim(t *testing.T) {
+	clk := newFakeClock()
+	l := newTest(t, clk, Config{Threshold: 3})
+	a := l.Attempt("k")
+	b := a
+	a.Release()
+	if r := b.Fail(); r != (Result{}) || l.Failures("k") != 0 {
+		t.Fatalf("copy failed after Release: %+v, %d", r, l.Failures("k"))
+	}
+
+	a = l.Attempt("k")
+	b = a
+	a.Release()
+	l.Fail("k")
+	b.Succeed()
+	if l.Failures("k") != 1 {
+		t.Fatalf("copy cleared a later failure: %d", l.Failures("k"))
+	}
+
+	l = newTest(t, clk, Config{Threshold: 1})
+	a = l.Attempt("k")
+	b = a
+	a.Release()
+	c := l.Attempt("k")
+	b.Release()
+	if d := l.Attempt("k"); !c.Allowed() || d.Allowed() {
+		t.Fatalf("copy freed a later reservation: c %v, d %v", c.Allowed(), d.Allowed())
+	}
+	c.Release()
+}
+
+// TestBanCoolingKeepsCounter is a regression test: restoring a record in
+// cooldown must leave the key's pending failures alone.
+func TestBanCoolingKeepsCounter(t *testing.T) {
+	clk := newFakeClock()
+	l := newTest(t, clk, Config{Threshold: 3, BanDuration: time.Minute, MaxBanDuration: time.Hour, Cooldown: time.Hour})
+	l.Fail("k")
+	l.Fail("k")
+	a := l.Attempt("k")
+	if err := l.Ban(Ban[string]{Key: "k", Until: clk.Now().Add(-time.Second), Offences: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if l.IsBanned("k") || l.Failures("k") != 2 {
+		t.Fatalf("cooling record: banned %v, %d failures", l.IsBanned("k"), l.Failures("k"))
+	}
+	if r := a.Fail(); !r.Banned || r.Offences != 2 {
+		t.Fatalf("in-flight attempt after restore: %+v", r)
+	}
+}
+
+// TestBanCoolingKeepsActiveBans is a regression test: with the ban table
+// full of active bans, a record in cooldown must not evict one of them.
+func TestBanCoolingKeepsActiveBans(t *testing.T) {
+	clk := newFakeClock()
+	l := newTest(t, clk, Config{Threshold: 1, MaxBans: 1, Shards: 1, Cooldown: time.Hour, Full: EvictSoonest})
+	l.Fail("a")
+	if err := l.Ban(Ban[string]{Key: "b", Until: clk.Now().Add(-time.Second), Offences: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if !l.IsBanned("a") || l.Stats().Evicted != 0 || len(l.Bans()) != 1 {
+		t.Fatalf("cooling record evicted an active ban: %+v", l.Stats())
 	}
 }

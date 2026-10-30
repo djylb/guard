@@ -68,15 +68,12 @@ func DecodeSecret(s string) ([]byte, error) {
 // authenticator apps import, usually from a QR code. Parameters equal to
 // their defaults are omitted, except the secret, the issuer and, for HOTP,
 // the counter.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (k *Key) URI() (string, error) {
 	digits, period, err := k.params()
 	if err != nil {
 		return "", err
-	}
-	switch k.Kind {
-	case TOTP, HOTP:
-	default:
-		return "", fmt.Errorf("%w: unknown %v", ErrInvalidKey, k.Kind)
 	}
 	var b strings.Builder
 	b.WriteString("otpauth://")
@@ -133,7 +130,7 @@ func escapeQuery(s string) string {
 // counter for HOTP; it rejects repeated parameters, unknown algorithms,
 // out-of-range digits and periods, and an issuer parameter that differs
 // from the issuer in the label. Unknown parameters, such as image, are
-// ignored. The returned Key has Skew 0.
+// ignored. The returned Key has SkewSteps 0.
 func ParseURI(uri string) (*Key, error) {
 	// The URI is split by hand: a label may hold characters that
 	// net/url would re-escape, losing which colon was literal.

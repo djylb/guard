@@ -3,7 +3,8 @@ package failban
 import (
 	"errors"
 	"net/netip"
-	"strings"
+
+	"github.com/djylb/guard/internal/addr"
 )
 
 // ErrInvalidAddr reports a remote address PrefixLen.OfRemote cannot parse.
@@ -21,15 +22,15 @@ var ErrInvalidAddr = errors.New("failban: invalid address")
 // field left out never lumps every client of that family under one key.
 // Negative lengths are clamped to zero, which covers the whole family.
 type PrefixLen struct {
-	V4 int
-	V6 int
+	V4 int `json:"v4"`
+	V6 int `json:"v6"`
 }
 
 // Of returns the network of addr that a key covers: the first V4 bits of
 // an IPv4 address, or of an IPv4-mapped IPv6 address, and the first V6
 // bits of other IPv6 addresses. Zero and lengths beyond the address size
-// mean the full address; negative ones are clamped to zero. The zone is dropped. It returns the zero Prefix for the
-// zero Addr.
+// mean the full address; negative ones are clamped to zero. The zone is
+// dropped. It returns the zero Prefix for the zero Addr.
 func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 	if !addr.IsValid() {
 		return netip.Prefix{}
@@ -48,20 +49,12 @@ func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 }
 
 // OfRemote is Of for an address in the form of net/http.Request.RemoteAddr
-// or net.Addr.String: "ip:port", "[ipv6]:port", or an IP address alone.
+// or net.Addr.String: "ip:port", "[ipv6]:port", "[ipv6]", or an IP address
+// alone. It does not allocate.
 func (p PrefixLen) OfRemote(remote string) (netip.Prefix, error) {
-	// Pick the parser by syntax, so that a valid address does not
-	// allocate a parse error first.
-	if strings.HasPrefix(remote, "[") || strings.Count(remote, ":") == 1 {
-		ap, err := netip.ParseAddrPort(remote)
-		if err != nil {
-			return netip.Prefix{}, ErrInvalidAddr
-		}
-		return p.Of(ap.Addr()), nil
-	}
-	addr, err := netip.ParseAddr(remote)
-	if err != nil {
+	a, ok := addr.Parse(remote)
+	if !ok {
 		return netip.Prefix{}, ErrInvalidAddr
 	}
-	return p.Of(addr), nil
+	return p.Of(a), nil
 }

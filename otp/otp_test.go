@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -24,7 +25,7 @@ var (
 func TestHOTPVectors(t *testing.T) {
 	// RFC 4226 appendix D.
 	want := []string{"755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"}
-	k := &Key{Secret: rfcSHA1}
+	k := &Key{Secret: rfcSHA1, Kind: HOTP}
 	for c, w := range want {
 		got, err := k.CounterCode(uint64(c))
 		if err != nil || got != w {
@@ -66,7 +67,7 @@ func TestTOTPVectors(t *testing.T) {
 }
 
 func TestVerifyReplay(t *testing.T) {
-	k := &Key{Secret: rfcSHA1, Skew: 1}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 1}
 	at := time.Unix(1_700_000_000, 0)
 	code, _ := k.Code(at)
 	cur, _ := k.Step(at)
@@ -96,7 +97,7 @@ func TestVerifyReplay(t *testing.T) {
 func TestVerifySkew(t *testing.T) {
 	at := time.Unix(1_700_000_010, 0)
 	for _, skew := range []uint{0, 1, 2} {
-		k := &Key{Secret: rfcSHA1, Skew: skew}
+		k := &Key{Secret: rfcSHA1, SkewSteps: skew}
 		for off := -3; off <= 3; off++ {
 			code, _ := k.Code(at.Add(time.Duration(off) * 30 * time.Second))
 			_, err := k.Verify(code, at, 0)
@@ -110,11 +111,11 @@ func TestVerifySkew(t *testing.T) {
 		}
 	}
 	// Skew at the ends of the counter range does not wrap.
-	k := &Key{Secret: rfcSHA1, Skew: 3}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 3}
 	if n, err := k.Verify("755224", time.Unix(29, 0), 0); err != nil || n != 1 {
 		t.Fatalf("Verify at step 0 = %d, %v", n, err)
 	}
-	k.Skew = 2
+	k.SkewSteps, k.Kind = 2, HOTP
 	code, _ := k.CounterCode(1<<64 - 2)
 	if n, err := k.VerifyCounter(code, 1<<64-3); err != nil || n != 1<<64-1 {
 		t.Fatalf("VerifyCounter at the end = %d, %v", n, err)
@@ -126,6 +127,7 @@ func TestVerifySkew(t *testing.T) {
 			t.Fatalf("last counter from %d: %v", next, err)
 		}
 	}
+	k.Kind = TOTP
 	if _, err := k.Verify("000000", time.Unix(-1, 0), 0); !errors.Is(err, ErrInvalidTime) {
 		t.Fatal(err)
 	}
@@ -135,7 +137,7 @@ func TestVerifySkew(t *testing.T) {
 }
 
 func TestVerifyCounter(t *testing.T) {
-	k := &Key{Secret: rfcSHA1, Skew: 3}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 3, Kind: HOTP}
 	// RFC 4226 counter 3 is 969429: accepted from next 0 with
 	// look-ahead 3, and the token resynchronises to 4.
 	n, err := k.VerifyCounter("969429", 0)
@@ -158,7 +160,7 @@ func TestCodeFormat(t *testing.T) {
 		if _, err := k.Verify(c, at, 0); !errors.Is(err, ErrCodeFormat) {
 			t.Errorf("Verify(%q) = %v", c, err)
 		}
-		if _, err := k.VerifyCounter(c, 0); !errors.Is(err, ErrCodeFormat) {
+		if _, err := (&Key{Secret: rfcSHA1, Kind: HOTP}).VerifyCounter(c, 0); !errors.Is(err, ErrCodeFormat) {
 			t.Errorf("VerifyCounter(%q) = %v", c, err)
 		}
 	}
@@ -411,7 +413,7 @@ func FuzzParseURI(f *testing.F) {
 func FuzzVerify(f *testing.F) {
 	f.Add("287082", uint64(0))
 	f.Add("+87082", uint64(1))
-	k := &Key{Secret: rfcSHA1, Skew: 1}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 1}
 	f.Fuzz(func(t *testing.T, code string, next uint64) {
 		n, err := k.Verify(code, time.Unix(59, 0), next)
 		if err == nil && (n <= next || !wellFormed(code, 6)) {
@@ -421,7 +423,7 @@ func FuzzVerify(f *testing.F) {
 }
 
 func BenchmarkVerify(b *testing.B) {
-	k := &Key{Secret: rfcSHA1, Skew: 1}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 1}
 	at := time.Unix(1_700_000_000, 0)
 	code, _ := k.Code(at)
 	b.ReportAllocs()
@@ -448,7 +450,7 @@ func TestGeneratorMatchesHMAC(t *testing.T) {
 	for alg, newHash := range news {
 		for _, size := range []int{16, 20, 63, 64, 65, 127, 128, 129, 300} {
 			secret := bytes.Repeat([]byte{byte(size), 0xa5}, size)[:size]
-			k := &Key{Secret: secret, Algorithm: alg, Digits: 8}
+			k := &Key{Secret: secret, Algorithm: alg, Digits: 8, Kind: HOTP}
 			for _, c := range []uint64{0, 1, 1 << 40} {
 				m := hmac.New(newHash, secret)
 				m.Write(binary.BigEndian.AppendUint64(nil, c))
@@ -466,7 +468,7 @@ func TestGeneratorMatchesHMAC(t *testing.T) {
 // TestStepAhead is a regression test: a stored step beyond the clock's
 // window is reported as such, not as an ordinary reuse.
 func TestStepAhead(t *testing.T) {
-	k := &Key{Secret: rfcSHA1, Skew: 1}
+	k := &Key{Secret: rfcSHA1, SkewSteps: 1}
 	at := time.Unix(1_700_000_000, 0)
 	cur, _ := k.Step(at)
 	code, _ := k.Code(at)
@@ -492,14 +494,19 @@ func TestStepAhead(t *testing.T) {
 }
 
 func TestVerifyAllocs(t *testing.T) {
-	k := &Key{Secret: rfcSHA1, Algorithm: SHA512, Skew: 2}
+	k := &Key{Secret: rfcSHA1, Algorithm: SHA512, SkewSteps: 2}
 	at := time.Unix(1_700_000_000, 0)
 	code, _ := k.Code(at)
+	hk := *k
+	hk.Kind = HOTP
 	if n := testing.AllocsPerRun(100, func() {
 		if _, err := k.Verify(code, at, 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := k.VerifyCounter(code, 0); err == nil {
+		if _, err := k.VerifyCounter(code, 0); !errors.Is(err, ErrInvalidKey) {
+			t.Fatal("TOTP key verified a counter")
+		}
+		if _, err := hk.VerifyCounter(code, 0); err == nil {
 			t.Fatal("counter code accepted")
 		}
 	}); n != 0 {
@@ -515,5 +522,66 @@ func TestParseAlgorithm(t *testing.T) {
 	}
 	if _, err := ParseAlgorithm("MD5"); !errors.Is(err, ErrInvalidKey) {
 		t.Error(err)
+	}
+}
+
+// TestKindEnforced checks that a key is used only with the methods of its
+// kind.
+func TestKindEnforced(t *testing.T) {
+	totp := &Key{Secret: rfcSHA1}
+	hotp := &Key{Secret: rfcSHA1, Kind: HOTP}
+	at := time.Unix(59, 0)
+	code, _ := totp.Code(at)
+	if _, err := hotp.Verify(code, at, 0); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("HOTP key Verify: %v", err)
+	}
+	if _, err := hotp.Code(at); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("HOTP key Code: %v", err)
+	}
+	if _, err := hotp.Step(at); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("HOTP key Step: %v", err)
+	}
+	if _, err := totp.VerifyCounter("755224", 0); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("TOTP key VerifyCounter: %v", err)
+	}
+	if _, err := totp.CounterCode(0); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("TOTP key CounterCode: %v", err)
+	}
+	if err := (&Key{Secret: rfcSHA1, Kind: Kind(7)}).Validate(); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("unknown kind validates: %v", err)
+	}
+}
+
+func TestKeyJSON(t *testing.T) {
+	k := Key{Issuer: "Example", Account: "alice", Secret: rfcSHA256, Period: time.Minute, Digits: 8,
+		SkewSteps: 1, Counter: 9, Algorithm: SHA256, Kind: HOTP}
+	b, err := json.Marshal(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Key
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("%s: %v", b, err)
+	}
+	if !bytes.Equal(got.Secret, k.Secret) || got.Issuer != k.Issuer || got.Account != k.Account || got.Period != k.Period ||
+		got.Digits != k.Digits || got.SkewSteps != k.SkewSteps || got.Counter != k.Counter ||
+		got.Algorithm != k.Algorithm || got.Kind != k.Kind {
+		t.Fatalf("round trip: %s -> %+v", b, got)
+	}
+	for _, bad := range []string{
+		`{"secret": "` + EncodeSecret(rfcSHA1) + `", "Kind": "hotp"}`,
+		`{"secret": "` + EncodeSecret(rfcSHA1) + `", "kind": "hotp", "kind": "totp"}`,
+		`{"secret": "` + EncodeSecret(rfcSHA1) + `", "algorithm": 1}`,
+		`{"secret": "` + EncodeSecret(rfcSHA1) + `", "period": 30}`,
+		`{"secret": "short"}`,
+		`{"secret": "` + EncodeSecret(rfcSHA1) + `", "kind": null}`,
+	} {
+		var k Key
+		if err := json.Unmarshal([]byte(bad), &k); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	if _, err := json.Marshal(Key{}); err == nil {
+		t.Error("invalid key marshalled")
 	}
 }

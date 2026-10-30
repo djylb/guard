@@ -23,7 +23,9 @@
 // longest time its timestamp can stay acceptable, and forgotten in the
 // order it was accepted, so expiry costs amortised O(1) per check. When a
 // shard is full of nonces that are still acceptable, Config.Full decides
-// what happens. Neither policy ever accepts a replay:
+// what happens; the policy acts per shard, and the default shard count
+// keeps shards large enough for it to apply only near Capacity. Neither
+// policy ever accepts a replay:
 //
 //   - ShrinkWindow, the default, forgets the oldest nonce early and raises
 //     the shard's floor to its timestamp: from then on the shard rejects
@@ -47,6 +49,7 @@
 package replay
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -55,6 +58,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/djylb/guard/internal/clock"
 	"github.com/djylb/guard/internal/conf"
 	"github.com/djylb/guard/internal/num"
 )
@@ -95,26 +99,48 @@ const (
 	RejectNew
 )
 
+var policyNames = [...]string{ShrinkWindow: "ShrinkWindow", RejectNew: "RejectNew"}
+
 // String returns the policy's name.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (p FullPolicy) String() string {
-	switch p {
-	case ShrinkWindow:
-		return "ShrinkWindow"
-	case RejectNew:
-		return "RejectNew"
-	default:
-		return fmt.Sprintf("FullPolicy(%d)", int(p))
+	if p >= 0 && int(p) < len(policyNames) {
+		return policyNames[p]
 	}
+	return fmt.Sprintf("FullPolicy(%d)", int(p))
 }
 
 // ParseFullPolicy returns the policy whose String form is s, ignoring
 // case.
 func ParseFullPolicy(s string) (FullPolicy, error) {
-	i, ok := conf.ParseName(s, ShrinkWindow.String(), RejectNew.String())
+	i, ok := conf.ParseName(s, policyNames[:]...)
 	if !ok {
 		return 0, fmt.Errorf("%w: unknown full policy %q", ErrInvalidConfig, s)
 	}
 	return FullPolicy(i), nil
+}
+
+// MarshalText implements encoding.TextMarshaler with the String form; an
+// unknown policy is an error.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (p FullPolicy) MarshalText() ([]byte, error) {
+	if p < 0 || int(p) >= len(policyNames) {
+		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidConfig, p)
+	}
+	return []byte(policyNames[p]), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler with ParseFullPolicy.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (p *FullPolicy) UnmarshalText(text []byte) error {
+	v, err := ParseFullPolicy(string(text))
+	if err == nil {
+		*p = v
+	}
+	return err
 }
 
 // DefaultCapacity is the capacity of a Config with zero Capacity.
@@ -135,17 +161,31 @@ type Config struct {
 	// senders whose clocks run ahead. It must not be negative.
 	Skew time.Duration
 	// Capacity is the number of nonces remembered at most, rounded up to
-	// a multiple of the shard count. It defaults to DefaultCapacity.
+	// a multiple of the shard count. It defaults to DefaultCapacity. The
+	// full policy acts per shard, so a shard can be full while the
+	// Window as a whole is not.
 	// Memory grows with the nonces remembered, by about 80 bytes each:
 	// some 5 MiB at the default capacity. A login form, which sees far
 	// fewer messages, can use a few thousand.
 	Capacity int
 	// Shards is the number of independently locked shards, rounded up to
 	// a power of two and lowered so that each shard holds at least one
-	// nonce. It defaults to a multiple of GOMAXPROCS.
+	// nonce. It defaults to a multiple of GOMAXPROCS, lowered so that each
+	// shard holds at least 256 nonces; a small Capacity thus gets a single
+	// shard. An explicit count makes each shard hold Capacity/Shards
+	// nonces, and a shard that fills applies Full on its own.
 	Shards int
 	// Full is the policy for a full shard. It defaults to ShrinkWindow.
 	Full FullPolicy
+}
+
+// jsonConfig is the JSON form of a Config.
+type jsonConfig struct {
+	Window   conf.Duration `json:"window"`
+	Skew     conf.Duration `json:"skew"`
+	Capacity int           `json:"capacity"`
+	Shards   int           `json:"shards"`
+	Full     FullPolicy    `json:"full"`
 }
 
 // UnmarshalJSON reads a Config from a JSON object such as
@@ -155,27 +195,24 @@ type Config struct {
 // with the fields window, skew, capacity, shards and full. Durations are
 // strings in the form of time.ParseDuration; policies are names as their
 // String method returns them. Fields that are absent keep their value;
-// unknown fields are an error. Now cannot be set from JSON.
+// unknown, repeated and null fields are an error, and names must match
+// exactly. Now cannot be set from JSON.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (c *Config) UnmarshalJSON(data []byte) error {
-	v := struct {
-		Full     conf.Enum[FullPolicy] `json:"full"`
-		Window   conf.Duration         `json:"window"`
-		Skew     conf.Duration         `json:"skew"`
-		Capacity int                   `json:"capacity"`
-		Shards   int                   `json:"shards"`
-	}{
-		Full:     conf.Enum[FullPolicy]{Parse: ParseFullPolicy, Value: c.Full},
-		Window:   conf.Duration(c.Window),
-		Skew:     conf.Duration(c.Skew),
-		Capacity: c.Capacity,
-		Shards:   c.Shards,
-	}
+	v := jsonConfig{conf.Duration(c.Window), conf.Duration(c.Skew), c.Capacity, c.Shards, c.Full}
 	if err := conf.Decode(data, &v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	c.Full, c.Window, c.Skew = v.Full.Value, time.Duration(v.Window), time.Duration(v.Skew)
-	c.Capacity, c.Shards = v.Capacity, v.Shards
+	c.Window, c.Skew, c.Capacity, c.Shards, c.Full = time.Duration(v.Window), time.Duration(v.Skew), v.Capacity, v.Shards, v.Full
 	return nil
+}
+
+// MarshalJSON writes c in the form UnmarshalJSON reads, without Now.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c Config) MarshalJSON() ([]byte, error) {
+	return json.Marshal(jsonConfig{conf.Duration(c.Window), conf.Duration(c.Skew), c.Capacity, c.Shards, c.Full})
 }
 
 // Stats is a snapshot of a Window's use.
@@ -193,9 +230,7 @@ type Stats struct {
 // Window remembers accepted nonces. It is safe for concurrent use. Its
 // zero value is not usable: create one with New.
 type Window struct {
-	now    func() time.Time
-	base   time.Time // the clock at New, with its monotonic reading
-	wall   time.Time // base without its monotonic reading
+	clock  clock.Clock
 	shards []shard
 	seeds  [2]maphash.Seed
 	window time.Duration
@@ -209,8 +244,8 @@ type key [2]uint64
 
 type entry struct {
 	key    key
-	ts     int64 // wall nanoseconds since Window.wall
-	forget int64 // monotonic nanoseconds since Window.base
+	ts     int64 // wall nanoseconds since the clock's base
+	forget int64 // monotonic nanoseconds since the clock's base
 }
 
 type shard struct {
@@ -247,15 +282,8 @@ func New(c Config) (*Window, error) {
 	}
 	n := num.Shards(c.Shards, capacity, runtime.GOMAXPROCS(0))
 	per := (capacity + n - 1) / n
-	now := c.Now
-	if now == nil {
-		now = time.Now
-	}
-	base := now()
 	w := &Window{
-		now:    now,
-		base:   base,
-		wall:   base.Round(0),
+		clock:  clock.New(c.Now),
 		shards: make([]shard, n),
 		seeds:  [2]maphash.Seed{maphash.MakeSeed(), maphash.MakeSeed()},
 		window: c.Window,
@@ -301,7 +329,7 @@ func (w *Window) CheckString(ts time.Time, nonce string) error {
 }
 
 func (w *Window) check(ts time.Time, k key) error {
-	now := w.now()
+	now, mono := w.clock.Read()
 	// Time.Sub saturates, so extreme timestamps cannot overflow.
 	d := ts.Sub(now)
 	if d > w.skew {
@@ -310,8 +338,7 @@ func (w *Window) check(ts time.Time, k key) error {
 	if d < -w.window {
 		return ErrStale
 	}
-	mono := int64(now.Sub(w.base))
-	tsOff := int64(ts.Round(0).Sub(w.wall))
+	tsOff := w.clock.Wall(ts)
 	s := &w.shards[k[0]&w.mask]
 	s.mu.Lock()
 	defer s.mu.Unlock()

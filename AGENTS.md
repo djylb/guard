@@ -11,9 +11,10 @@
   reclaimed by the calls that use it.
 - Fail closed: a zero value or an invalid configuration denies or returns
   an error, never panics and never accepts.
-- A replay window, challenge, code or token is never accepted twice within
-  its validity, also when the tables are full or the wall clock steps; time
-  limits use the monotonic clock.
+- A replay window entry, challenge or one-time code is never accepted
+  twice within its validity, also when the tables are full or the wall
+  clock steps; time limits use the monotonic clock. CSRF tokens are the
+  exception by design: reusable within their MaxAge.
 - Compare MACs, codes and tokens in constant time; draw secrets and nonces
   from crypto/rand.
 - Checks (replay, ban, challenge, one-time password, CSRF token and

@@ -25,13 +25,17 @@
 //
 // # Behind a reverse proxy
 //
-// Behind a reverse proxy, RemoteAddr is the proxy's address. List the
-// proxies in TrustedProxies: ClientAddr then reads the client's address
+// Behind a reverse proxy, RemoteAddr is the proxy's address, often a
+// loopback one. With LoopbackPeers or Peers, a request that carries a
+// forwarding header from a peer outside TrustedProxies is rejected, so
+// that LocalAdmin behind a proxy on the same host fails closed instead of
+// admitting every remote client. List the proxies in TrustedProxies: ClientAddr then reads the client's address
 // from ForwardedHeader, skipping trusted proxies from the right, and Peers
 // apply to it. Every trusted host can claim any client address, so list
 // the proxies themselves, not the network they live in. A request from a
-// trusted proxy that names no client is rejected. Configure the proxy to pass the original Host header on,
-// and list the public host names in Hosts:
+// trusted proxy that names no client is rejected. Configure the proxy to
+// pass the original Host header on, and list the public host names in
+// Hosts:
 //
 //	g, err := webguard.New(webguard.Config{
 //		Hosts:           []string{"admin.example.com"},
@@ -45,7 +49,9 @@
 //
 // Check does not allocate, also when it rejects, except when a request
 // carries Origin but no Sec-Fetch-Site: then CrossOriginProtection parses
-// the Origin with net/url.
+// the Origin with net/url. CSRF.Verify and CSRF.Handler do not allocate
+// either, except when the handler reads the token from a form body,
+// which net/http parses.
 //
 // # Relationship to CrossOriginProtection
 //
@@ -71,6 +77,7 @@
 package webguard
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -78,6 +85,7 @@ import (
 	"net/textproto"
 	"strings"
 
+	"github.com/djylb/guard/internal/addr"
 	"github.com/djylb/guard/internal/conf"
 )
 
@@ -99,8 +107,9 @@ var (
 	// ErrInvalidConfig reports a Config that New cannot use.
 	ErrInvalidConfig = errors.New("webguard: invalid config")
 
-	errPeerAddr = fmt.Errorf("%w: %w", ErrPeer, ErrClientAddr)
-	errNoOrigin = fmt.Errorf("%w: no Origin, Sec-Fetch-Site or same-origin Referer", ErrCrossOrigin)
+	errPeerAddr  = fmt.Errorf("%w: %w", ErrPeer, ErrClientAddr)
+	errForwarded = fmt.Errorf("%w: forwarded by a peer that is not a trusted proxy", ErrPeer)
+	errNoOrigin  = fmt.Errorf("%w: no Origin, Sec-Fetch-Site or same-origin Referer", ErrCrossOrigin)
 )
 
 // Config configures a Guard.
@@ -142,6 +151,14 @@ type Config struct {
 	// Peers set, other clients are rejected, and so is every request over
 	// a Unix socket, whose RemoteAddr is not an IP address; leave both
 	// off there.
+	//
+	// A reverse proxy on the same host connects from loopback on behalf
+	// of remote clients. So with LoopbackPeers or Peers set, a request
+	// that carries ForwardedHeader, X-Forwarded-For, Forwarded,
+	// X-Real-IP, True-Client-IP, X-Client-IP or X-Forwarded-Host is
+	// rejected unless it comes from TrustedProxies: a peer
+	// that forwards for someone else is not the client. List such a proxy
+	// in TrustedProxies, and make sure it sends ForwardedHeader.
 	LoopbackPeers bool
 	// RequireOrigin rejects unsafe requests that carry neither
 	// Sec-Fetch-Site nor Origin unless their Referer is same-origin.
@@ -154,27 +171,38 @@ type Config struct {
 	SecurityHeaders bool
 }
 
+// jsonConfig is the JSON form of a Config.
+type jsonConfig struct {
+	Hosts           []string `json:"hosts,omitempty"`
+	TrustedOrigins  []string `json:"trusted_origins,omitempty"`
+	Peers           []string `json:"peers,omitempty"`
+	TrustedProxies  []string `json:"trusted_proxies,omitempty"`
+	ForwardedHeader string   `json:"forwarded_header"`
+	LoopbackHosts   bool     `json:"loopback_hosts"`
+	LoopbackPeers   bool     `json:"loopback_peers"`
+	RequireOrigin   bool     `json:"require_origin"`
+	SecurityHeaders bool     `json:"security_headers"`
+}
+
+//goland:noinspection GoMixedReceiverTypes
+func (c *Config) json() jsonConfig {
+	return jsonConfig{c.Hosts, c.TrustedOrigins, c.Peers, c.TrustedProxies, c.ForwardedHeader,
+		c.LoopbackHosts, c.LoopbackPeers, c.RequireOrigin, c.SecurityHeaders}
+}
+
 // UnmarshalJSON reads a Config from a JSON object such as
 //
 //	{"hosts": ["admin.example.com"], "trusted_proxies": ["10.0.0.2", "10.0.0.3"], "require_origin": true}
 //
 // with the fields hosts, trusted_origins, loopback_hosts, loopback_peers,
 // peers, trusted_proxies, forwarded_header, require_origin and
-// security_headers. Fields that are absent keep their value; unknown
-// fields are an error. Deny cannot be set from JSON.
+// security_headers. Fields that are absent keep their value; unknown,
+// repeated and null fields are an error, and names must match exactly.
+// Deny cannot be set from JSON.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (c *Config) UnmarshalJSON(data []byte) error {
-	v := struct {
-		Hosts           []string `json:"hosts"`
-		TrustedOrigins  []string `json:"trusted_origins"`
-		Peers           []string `json:"peers"`
-		TrustedProxies  []string `json:"trusted_proxies"`
-		ForwardedHeader string   `json:"forwarded_header"`
-		LoopbackHosts   bool     `json:"loopback_hosts"`
-		LoopbackPeers   bool     `json:"loopback_peers"`
-		RequireOrigin   bool     `json:"require_origin"`
-		SecurityHeaders bool     `json:"security_headers"`
-	}{c.Hosts, c.TrustedOrigins, c.Peers, c.TrustedProxies, c.ForwardedHeader,
-		c.LoopbackHosts, c.LoopbackPeers, c.RequireOrigin, c.SecurityHeaders}
+	v := c.json()
 	if err := conf.Decode(data, &v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
@@ -184,10 +212,19 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MarshalJSON writes c in the form UnmarshalJSON reads, without Deny.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c Config) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.json())
+}
+
 // LocalAdmin returns the configuration for an admin server bound to a
 // loopback address: loopback Host names and peers only, a same-origin
 // Referer required when Origin and Sec-Fetch-Site are missing, and
-// security headers.
+// security headers. Requests forwarded by a reverse proxy on the same
+// host are rejected (see LoopbackPeers); such a deployment is not local
+// and needs Hosts, TrustedProxies and Peers instead.
 func LocalAdmin() Config {
 	return Config{LoopbackHosts: true, LoopbackPeers: true, RequireOrigin: true, SecurityHeaders: true}
 }
@@ -295,11 +332,14 @@ func (g *Guard) Check(r *http.Request) error {
 		return ErrUninitialized
 	}
 	if g.loopbackPeers || len(g.peers) > 0 {
-		addr, err := g.ClientAddr(r)
+		a, proxied, err := g.clientAddr(r)
 		if err != nil {
 			return errPeerAddr
 		}
-		if (!g.loopbackPeers || !addr.IsLoopback()) && !contains(g.peers, addr) {
+		if !proxied && g.forwardedFor(r) {
+			return errForwarded
+		}
+		if (!g.loopbackPeers || !a.IsLoopback()) && !contains(g.peers, a) {
 			return ErrPeer
 		}
 	}
@@ -361,12 +401,38 @@ func (g *Guard) ClientAddr(r *http.Request) (netip.Addr, error) {
 	if g == nil || g.cop == nil {
 		return netip.Addr{}, ErrUninitialized
 	}
-	addr, ok := parseNode(r.RemoteAddr)
-	if !ok {
-		return netip.Addr{}, ErrClientAddr
+	a, _, err := g.clientAddr(r)
+	return a, err
+}
+
+// forwardedFor reports whether r carries a header in which proxies name
+// the client they forward for.
+func (g *Guard) forwardedFor(r *http.Request) bool {
+	h := r.Header
+	if len(h[g.forwarded]) > 0 {
+		return true
 	}
-	if !contains(g.proxies, addr) {
-		return addr, nil
+	for _, name := range forwardingHeaders {
+		if len(h[name]) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardingHeaders are the canonical names of the headers in which
+// proxies commonly name the client or the host they forward for.
+var forwardingHeaders = [...]string{"X-Forwarded-For", "Forwarded", "X-Real-Ip", "True-Client-Ip", "X-Client-Ip", "X-Forwarded-Host"}
+
+// clientAddr is ClientAddr, and also reports whether RemoteAddr is a
+// trusted proxy.
+func (g *Guard) clientAddr(r *http.Request) (netip.Addr, bool, error) {
+	a, ok := addr.Parse(r.RemoteAddr)
+	if !ok {
+		return netip.Addr{}, false, ErrClientAddr
+	}
+	if !contains(g.proxies, a) {
+		return a, false, nil
 	}
 	values := r.Header[g.forwarded]
 	for i := len(values) - 1; i >= 0; i-- {
@@ -379,27 +445,27 @@ func (g *Guard) ClientAddr(r *http.Request) (netip.Addr, error) {
 				list = ""
 			}
 			if g.rfc7239 {
-				addr, ok = forwardedFor(hop)
+				a, ok = rfc7239For(hop)
 			} else {
-				addr, ok = parseNode(strings.TrimSpace(hop))
+				a, ok = addr.Parse(strings.TrimSpace(hop))
 			}
 			if !ok {
-				return netip.Addr{}, ErrClientAddr
+				return netip.Addr{}, true, ErrClientAddr
 			}
-			if !contains(g.proxies, addr) {
-				return addr, nil
+			if !contains(g.proxies, a) {
+				return a, true, nil
 			}
 		}
 	}
-	return netip.Addr{}, ErrClientAddr
+	return netip.Addr{}, true, ErrClientAddr
 }
 
-// forwardedFor returns the address in the for parameter of one element of
+// rfc7239For returns the address in the for parameter of one element of
 // an RFC 7239 Forwarded header, such as for=192.0.2.1;proto=https or
 // for="[2001:db8::1]:443". It fails for a missing or repeated for
 // parameter and for "unknown" and obfuscated nodes, which cannot be
 // checked against TrustedProxies.
-func forwardedFor(element string) (netip.Addr, bool) {
+func rfc7239For(element string) (netip.Addr, bool) {
 	var node string
 	found := false
 	for element != "" {
@@ -425,7 +491,7 @@ func forwardedFor(element string) (netip.Addr, bool) {
 				return netip.Addr{}, false
 			}
 			// Quoted pairs and quotes left inside cannot form an
-			// address, so parseNode rejects them.
+			// address, so addr.Parse rejects them.
 			value = value[1 : len(value)-1]
 		}
 		node = value
@@ -433,46 +499,7 @@ func forwardedFor(element string) (netip.Addr, bool) {
 	if !found {
 		return netip.Addr{}, false
 	}
-	return parseNode(node)
-}
-
-// parseNode parses an IP address with or without a port: "ip", "ip:port",
-// "[ipv6]" or "[ipv6]:port". It picks the parser by syntax, so that a
-// valid address does not allocate a parse error first.
-func parseNode(s string) (netip.Addr, bool) {
-	var a netip.Addr
-	var err error
-	switch {
-	case strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]"):
-		a, err = netip.ParseAddr(s[1 : len(s)-1])
-		if err == nil && !a.Is6() {
-			return netip.Addr{}, false
-		}
-	case hasPort(s):
-		if ap, perr := netip.ParseAddrPort(s); perr == nil {
-			a = ap.Addr()
-		} else {
-			err = perr
-		}
-	case strings.IndexByte(s, '%') >= 0 || ipChars(s):
-		a, err = netip.ParseAddr(s)
-	default:
-		return netip.Addr{}, false
-	}
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	return a.Unmap().WithZone(""), true
-}
-
-// hasPort reports whether s has the syntax of an address with a port:
-// "[ipv6]:port" or "ipv4:port".
-func hasPort(s string) bool {
-	if s != "" && s[0] == '[' {
-		return true
-	}
-	i := strings.IndexByte(s, ':')
-	return i >= 0 && strings.IndexByte(s[i+1:], ':') < 0
+	return addr.Parse(node)
 }
 
 // validToken reports whether s is an HTTP token (RFC 9110), as a header
@@ -546,29 +573,11 @@ func loopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	if !ipChars(host) {
+	if !addr.IPChars(host) {
 		return false
 	}
 	a, err := netip.ParseAddr(host)
 	return err == nil && a.Zone() == "" && a.Unmap().IsLoopback()
-}
-
-// ipChars reports whether s consists of the characters of an IP address
-// without a zone, so that names are rejected before netip allocates a
-// parse error for them.
-func ipChars(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F', c == '.', c == ':':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // splitHost splits a Host header value into its host, without brackets

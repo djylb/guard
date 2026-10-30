@@ -54,10 +54,9 @@ package pow
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -85,18 +84,13 @@ const (
 const MinKeySize = 16
 
 const (
-	headerLen = 1 + 1 + 8 + 16
-	rawLen    = headerLen + sha256.Size
+	headerLen = 1 + 1 + 8 + sign.NonceSize
+	rawLen    = headerLen + sign.Size
 	// TokenLen is the length of a token string.
 	TokenLen = (rawLen*8 + 5) / 6
 )
 
 const domain = "guard/pow/v1"
-
-var (
-	enc    = base64.RawURLEncoding
-	strict = enc.Strict()
-)
 
 // Errors returned by Verify and Parse.
 var (
@@ -120,6 +114,10 @@ var (
 	ErrReplay = errors.New("pow: challenge already used")
 	// ErrStore wraps an error of a Store; the challenge is rejected.
 	ErrStore = errors.New("pow: store failed")
+
+	// errStoreFull is the rejection of a full RejectNew MemoryStore,
+	// prepared so that it does not allocate.
+	errStoreFull = fmt.Errorf("%w: %w", ErrStore, replay.ErrFull)
 	// ErrUninitialized reports a Challenger not created by New.
 	ErrUninitialized = errors.New("pow: challenger not created by New")
 	// ErrInvalidConfig reports a Config or argument that cannot be used.
@@ -158,25 +156,38 @@ type Config struct {
 	ReplayCapacity int
 }
 
+// jsonConfig is the JSON form of a Config.
+type jsonConfig struct {
+	Key            conf.Key      `json:"key,omitzero"`
+	PreviousKeys   [][]byte      `json:"previous_keys,omitempty"`
+	TTL            conf.Duration `json:"ttl"`
+	Skew           conf.Duration `json:"skew"`
+	Difficulty     int           `json:"difficulty"`
+	ReplayCapacity int           `json:"replay_capacity"`
+}
+
+// json returns c in JSON form, with the key absent.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c *Config) json() jsonConfig {
+	return jsonConfig{conf.Key{}, c.PreviousKeys, conf.Duration(c.TTL), conf.Duration(c.Skew), c.Difficulty, c.ReplayCapacity}
+}
+
 // UnmarshalJSON reads a Config from a JSON object such as
 //
 //	{"key": "base64...", "difficulty": 18, "ttl": "2m", "skew": "2s"}
 //
 // with the fields key and previous_keys (standard base64), difficulty,
 // ttl, skew and replay_capacity. Durations are strings in the form of
-// time.ParseDuration. Fields that are absent keep their value; unknown
-// fields and null values are an error. The key is required unless the
-// Config already has one; "key": "random" asks for a key generated per
-// process. Now and Store cannot be set from JSON.
+// time.ParseDuration. Fields that are absent keep their value; unknown,
+// repeated and null fields are an error, and names must match exactly.
+// The key is required unless the Config already has one; "key": "random"
+// asks for a key generated per process. Now and Store cannot be set from
+// JSON.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (c *Config) UnmarshalJSON(data []byte) error {
-	v := struct {
-		Key            conf.Key      `json:"key"`
-		PreviousKeys   [][]byte      `json:"previous_keys"`
-		TTL            conf.Duration `json:"ttl"`
-		Skew           conf.Duration `json:"skew"`
-		Difficulty     int           `json:"difficulty"`
-		ReplayCapacity int           `json:"replay_capacity"`
-	}{conf.Key{}, c.PreviousKeys, conf.Duration(c.TTL), conf.Duration(c.Skew), c.Difficulty, c.ReplayCapacity}
+	v := c.json()
 	if err := conf.Decode(data, &v); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
@@ -187,6 +198,18 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	c.Key, c.PreviousKeys, c.TTL, c.Skew = key, v.PreviousKeys, time.Duration(v.TTL), time.Duration(v.Skew)
 	c.Difficulty, c.ReplayCapacity = v.Difficulty, v.ReplayCapacity
 	return nil
+}
+
+// MarshalJSON writes c in the form UnmarshalJSON reads, for logging the
+// effective configuration. It writes no secret: the key is "random" if
+// it is nil and left out otherwise, and PreviousKeys, Now and Store are
+// left out.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c Config) MarshalJSON() ([]byte, error) {
+	v := c.json()
+	v.Key, v.PreviousKeys = conf.Redacted(c.Key), nil
+	return json.Marshal(v)
 }
 
 // Challenger issues and verifies challenges. It is safe for concurrent
@@ -239,7 +262,11 @@ func New(c Config) (*Challenger, error) {
 		now = time.Now
 	}
 	store := c.Store
-	if m, ok := store.(*MemoryStore); ok && m != nil && ttl+skew > m.window+m.skew {
+	m, ok := store.(*MemoryStore)
+	if ok && (m == nil || m.w == nil) {
+		return nil, fmt.Errorf("%w: MemoryStore not created by NewMemoryStore", ErrInvalidConfig)
+	}
+	if ok && ttl+skew > m.window+m.skew {
 		return nil, fmt.Errorf("%w: TTL %v plus skew %v exceeds the MemoryStore's window %v plus skew %v",
 			ErrInvalidConfig, ttl, skew, m.window, m.skew)
 	}
@@ -287,10 +314,7 @@ func (c *Challenger) issue(difficulty uint8, binding []string) string {
 	raw[0] = Version
 	raw[1] = difficulty
 	binary.BigEndian.PutUint64(raw[2:10], uint64(c.now().Add(c.ttl).UnixMilli()))
-	_, _ = rand.Read(raw[10:headerLen]) // crypto/rand.Read never fails
-	mac := c.signer.Sign(raw[:headerLen], binding...)
-	copy(raw[headerLen:], mac[:])
-	return enc.EncodeToString(raw[:])
+	return c.signer.Seal(raw[:], binding...)
 }
 
 // Verify checks that solution solves token, that the challenge was issued
@@ -301,7 +325,9 @@ func (c *Challenger) issue(difficulty uint8, binding []string) string {
 // retry it with a correct solution.
 //
 // The errors are distinct for logs and metrics; answer the client alike
-// for all of them, apart from asking for a new challenge.
+// for all of them, apart from asking for a new challenge. Verify does not
+// allocate, also when it rejects, except to wrap an error of a Store
+// other than a MemoryStore in ErrStore.
 func (c *Challenger) Verify(token string, solution uint64, binding ...string) error {
 	if c == nil || c.signer == nil {
 		return ErrUninitialized
@@ -324,7 +350,7 @@ func (c *Challenger) Verify(token string, solution uint64, binding ...string) er
 	if !meets(&raw, solution, ch.Difficulty) {
 		return ErrInsufficientWork
 	}
-	if !c.signer.Verify(raw[headerLen:], raw[:headerLen], binding...) {
+	if !c.signer.Check(raw[:], binding...) {
 		return ErrInvalidSignature
 	}
 	fresh, err := c.store.MarkUsed(ch.Nonce, ch.Expires)
@@ -335,6 +361,8 @@ func (c *Challenger) Verify(token string, solution uint64, binding ...string) er
 		return ErrReplay
 	case errors.Is(err, ErrExpired), errors.Is(err, ErrNotYetValid):
 		return err
+	case errors.Is(err, replay.ErrFull):
+		return errStoreFull
 	default:
 		return fmt.Errorf("%w: %w", ErrStore, err)
 	}
@@ -385,14 +413,23 @@ func NewMemoryStore(c replay.Config) (*MemoryStore, error) {
 	return &MemoryStore{w: w, window: c.Window, skew: c.Skew}, nil
 }
 
-// Stats returns the use of the store's replay window.
+// Stats returns the use of the store's replay window; zero for a
+// MemoryStore not created by NewMemoryStore.
 func (m *MemoryStore) Stats() replay.Stats {
+	if m == nil {
+		return replay.Stats{}
+	}
 	return m.w.Stats()
 }
 
 // MarkUsed implements Store. When the window is full, it reports the
-// oldest challenges as expired (see replay.ShrinkWindow).
+// oldest challenges as expired (see replay.ShrinkWindow), or returns
+// replay.ErrFull with replay.RejectNew. A MemoryStore not created by
+// NewMemoryStore returns replay.ErrUninitialized.
 func (m *MemoryStore) MarkUsed(id ID, expires time.Time) (bool, error) {
+	if m == nil {
+		return false, replay.ErrUninitialized
+	}
 	err := m.w.Check(expires.Add(-m.window), id[:])
 	switch {
 	case err == nil:
@@ -406,6 +443,17 @@ func (m *MemoryStore) MarkUsed(id ID, expires time.Time) (bool, error) {
 	default:
 		return false, err
 	}
+}
+
+// Stats returns the use of the Challenger's Store if it is a
+// MemoryStore, such as the default one, and zero Stats otherwise. If
+// Evicted grows, ReplayCapacity is too small for the load.
+func (c *Challenger) Stats() replay.Stats {
+	if c == nil {
+		return replay.Stats{}
+	}
+	m, _ := c.store.(*MemoryStore)
+	return m.Stats()
 }
 
 // Difficulty returns the difficulty Issue asks for.
@@ -437,12 +485,7 @@ func Parse(token string) (Challenge, error) {
 
 func decode(token string) ([rawLen]byte, Challenge, error) {
 	var raw [rawLen]byte
-	if len(token) != TokenLen {
-		return raw, Challenge{}, ErrMalformed
-	}
-	var src [TokenLen]byte
-	copy(src[:], token)
-	if n, err := strict.Decode(raw[:], src[:]); err != nil || n != rawLen {
+	if !sign.Open(raw[:], token) {
 		return raw, Challenge{}, ErrMalformed
 	}
 	if raw[0] != Version {
