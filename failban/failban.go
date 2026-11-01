@@ -113,10 +113,10 @@
 // precision, so stepping the wall clock neither lifts nor extends bans.
 //
 // Settings: the zero value of a field selects its default, stated in the
-// field's documentation; for timeouts and limits it is a safe bound unless
-// the field says otherwise. A negative timeout means no timeout, as for
-// http.Server.IdleTimeout. Other negative values are an error unless the
-// field gives them a meaning.
+// field's documentation; for limits it is a safe bound, and table
+// capacities have no unlimited setting. Durations here are policy
+// parameters, not I/O timeouts: a negative value is an error, as are other
+// negative values unless the field gives them a meaning.
 package failban
 
 import (
@@ -483,9 +483,23 @@ type shard[K comparable] struct {
 
 // New returns a Limiter configured by c.
 func New[K comparable](c Config) (*Limiter[K], error) {
-	if c.Threshold < 0 || c.Window < 0 || c.BanDuration < 0 || c.MaxBanDuration < 0 ||
-		c.Cooldown < 0 || c.MaxPending < 0 || c.MaxBans < 0 || c.Shards < 0 {
-		return nil, fmt.Errorf("%w: negative field in %+v", ErrInvalidConfig, c)
+	for _, f := range []struct {
+		name string
+		neg  bool
+		v    any
+	}{
+		{"Threshold", c.Threshold < 0, c.Threshold},
+		{"Window", c.Window < 0, c.Window},
+		{"BanDuration", c.BanDuration < 0, c.BanDuration},
+		{"MaxBanDuration", c.MaxBanDuration < 0, c.MaxBanDuration},
+		{"Cooldown", c.Cooldown < 0, c.Cooldown},
+		{"MaxPending", c.MaxPending < 0, c.MaxPending},
+		{"MaxBans", c.MaxBans < 0, c.MaxBans},
+		{"Shards", c.Shards < 0, c.Shards},
+	} {
+		if f.neg {
+			return nil, fmt.Errorf("%w: negative %s %v", ErrInvalidConfig, f.name, f.v)
+		}
 	}
 	switch c.Full {
 	case LockShard, EvictSoonest:

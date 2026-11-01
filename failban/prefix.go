@@ -36,7 +36,8 @@ type PrefixLen struct {
 // bits of other IPv6 addresses. Zero and lengths beyond the address size
 // mean the full address. The zone is dropped. It returns the zero Prefix
 // for the zero Addr. It panics on a negative length, which Validate
-// reports, rather than put every address under one key.
+// reports, rather than put every address under one key: call Validate when
+// the lengths come from configuration.
 func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 	if !addr.IsValid() {
 		return netip.Prefix{}

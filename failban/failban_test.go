@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -940,5 +941,13 @@ func TestBanCoolingKeepsActiveBans(t *testing.T) {
 	}
 	if !l.IsBanned("a") || l.Stats().Evicted != 0 || len(l.Bans()) != 1 {
 		t.Fatalf("cooling record evicted an active ban: %+v", l.Stats())
+	}
+}
+
+// A negative field fails New with its name and value.
+func TestNewNamesNegativeField(t *testing.T) {
+	_, err := New[string](Config{Window: -time.Second})
+	if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "Window -1s") {
+		t.Fatalf("New = %v", err)
 	}
 }

@@ -76,10 +76,10 @@
 // header only as far as TrustedProxies say.
 //
 // Settings: the zero value of a field selects its default, stated in the
-// field's documentation; for timeouts and limits it is a safe bound unless
-// the field says otherwise. A negative timeout means no timeout, as for
-// http.Server.IdleTimeout. Other negative values are an error unless the
-// field gives them a meaning.
+// field's documentation; for limits it is a safe bound, and table
+// capacities have no unlimited setting. Durations here are policy
+// parameters, not I/O timeouts: a negative value is an error, as are other
+// negative values unless the field gives them a meaning.
 package webguard
 
 import (
