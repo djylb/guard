@@ -498,9 +498,8 @@ func TestPrefixLen(t *testing.T) {
 		{in: "[2001:db8::1]:443", v4: 32, v6: 64, want: "2001:db8::/64"},
 		{in: "[::ffff:203.0.113.7]:443", v4: 32, v6: 64, want: "203.0.113.7/32"},
 		{in: "fe80::1%eth0", v4: 32, v6: 200, want: "fe80::1/128"},
-		{in: "[fe80::1%eth0]:80", v4: -3, v6: 10, want: "fe80::/10"},
+		{in: "[fe80::1%eth0]:80", v4: 32, v6: 10, want: "fe80::/10"},
 		{in: "10.1.2.3", v4: 99, v6: 0, want: "10.1.2.3/32"},
-		{in: "10.1.2.3", v4: -1, v6: 0, want: "0.0.0.0/0"},
 		// Zero fields mean the full length, never /0.
 		{in: "[2001:db8::1]:1", v4: 32, want: "2001:db8::1/128"},
 		{in: "192.0.2.1:1", v6: 64, want: "192.0.2.1/32"},
@@ -525,6 +524,15 @@ func TestPrefixLen(t *testing.T) {
 	}
 	if p := (PrefixLen{V4: 32, V6: 64}).Of(netip.Addr{}); p.IsValid() {
 		t.Error("prefix of the zero Addr")
+	}
+	// Negative lengths are rejected, not clamped to /0.
+	for _, p := range []PrefixLen{{V4: -1, V6: 64}, {V4: 32, V6: -1}} {
+		if got, err := p.OfRemote("10.1.2.3"); !errors.Is(err, ErrInvalidPrefixLen) || p.Valid() {
+			t.Errorf("%+v: %v, %v", p, got, err)
+		}
+	}
+	if p := (PrefixLen{V4: -1}).Of(netip.MustParseAddr("10.1.2.3")); p.IsValid() {
+		t.Errorf("Of with a negative length = %v", p)
 	}
 }
 
