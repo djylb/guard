@@ -2,6 +2,7 @@ package failban
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 
 	"github.com/djylb/guard/internal/addr"
@@ -10,8 +11,8 @@ import (
 // ErrInvalidAddr reports a remote address PrefixLen.OfRemote cannot parse.
 var ErrInvalidAddr = errors.New("failban: invalid address")
 
-// ErrInvalidPrefixLen reports a negative length, which PrefixLen.OfRemote
-// fails with.
+// ErrInvalidPrefixLen reports a negative length, which PrefixLen.Validate
+// and OfRemote return.
 var ErrInvalidPrefixLen = errors.New("failban: negative prefix length")
 
 // PrefixLen gives the length of the network prefix that a key covers, in
@@ -34,7 +35,8 @@ type PrefixLen struct {
 // an IPv4 address, or of an IPv4-mapped IPv6 address, and the first V6
 // bits of other IPv6 addresses. Zero and lengths beyond the address size
 // mean the full address. The zone is dropped. It returns the zero Prefix
-// for the zero Addr and for a negative length, which Valid reports.
+// for the zero Addr. It panics on a negative length, which Validate
+// reports, rather than put every address under one key.
 func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 	if !addr.IsValid() {
 		return netip.Prefix{}
@@ -45,7 +47,7 @@ func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 		n = p.V4
 	}
 	if n < 0 {
-		return netip.Prefix{}
+		panic(ErrInvalidPrefixLen)
 	}
 	if n == 0 || n > addr.BitLen() {
 		n = addr.BitLen()
@@ -59,8 +61,8 @@ func (p PrefixLen) Of(addr netip.Addr) netip.Prefix {
 // alone. It does not allocate.
 // It fails with ErrInvalidPrefixLen when a length is negative.
 func (p PrefixLen) OfRemote(remote string) (netip.Prefix, error) {
-	if !p.Valid() {
-		return netip.Prefix{}, ErrInvalidPrefixLen
+	if err := p.Validate(); err != nil {
+		return netip.Prefix{}, err
 	}
 	a, ok := addr.Parse(remote)
 	if !ok {
@@ -69,5 +71,14 @@ func (p PrefixLen) OfRemote(remote string) (netip.Prefix, error) {
 	return p.Of(a), nil
 }
 
-// Valid reports whether neither length is negative.
-func (p PrefixLen) Valid() bool { return p.V4 >= 0 && p.V6 >= 0 }
+// Validate returns an error matching ErrInvalidPrefixLen, which names the
+// length, when one is negative.
+func (p PrefixLen) Validate() error {
+	if p.V4 < 0 {
+		return fmt.Errorf("%w: V4 %d", ErrInvalidPrefixLen, p.V4)
+	}
+	if p.V6 < 0 {
+		return fmt.Errorf("%w: V6 %d", ErrInvalidPrefixLen, p.V6)
+	}
+	return nil
+}

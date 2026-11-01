@@ -527,13 +527,18 @@ func TestPrefixLen(t *testing.T) {
 	}
 	// Negative lengths are rejected, not clamped to /0.
 	for _, p := range []PrefixLen{{V4: -1, V6: 64}, {V4: 32, V6: -1}} {
-		if got, err := p.OfRemote("10.1.2.3"); !errors.Is(err, ErrInvalidPrefixLen) || p.Valid() {
+		if got, err := p.OfRemote("10.1.2.3"); !errors.Is(err, ErrInvalidPrefixLen) || !errors.Is(p.Validate(), ErrInvalidPrefixLen) {
 			t.Errorf("%+v: %v, %v", p, got, err)
 		}
 	}
-	if p := (PrefixLen{V4: -1}).Of(netip.MustParseAddr("10.1.2.3")); p.IsValid() {
-		t.Errorf("Of with a negative length = %v", p)
-	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("Of with a negative length did not panic")
+			}
+		}()
+		_ = PrefixLen{V4: -1}.Of(netip.MustParseAddr("10.1.2.3"))
+	}()
 }
 
 func BenchmarkFail(b *testing.B) {
