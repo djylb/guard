@@ -73,11 +73,12 @@ type CSRFConfig struct {
 	// rotating Key: keep the old key here for one MaxAge.
 	PreviousKeys [][]byte
 	// MaxAge is how long a token stays valid, at millisecond precision
-	// and at least a millisecond. It defaults to DefaultCSRFMaxAge.
+	// and at least a millisecond. 0 means DefaultCSRFMaxAge (12 hours).
+	// A negative value is an error.
 	MaxAge time.Duration
 	// Skew is how far ahead of this server's clock the clock of a server
-	// that issued a token may run. It defaults to DefaultCSRFSkew and
-	// must not be negative.
+	// that issued a token may run. 0 means DefaultCSRFSkew (1 minute).
+	// A negative value is an error.
 	Skew time.Duration
 	// MultipartForms also reads the token from multipart/form-data
 	// bodies when the header is absent. Parsing one reads the whole body,

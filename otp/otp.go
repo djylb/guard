@@ -44,6 +44,12 @@
 // failban.Limiter, and answer every rejected code alike: telling
 // ErrCodeReused from ErrCodeMismatch confirms to an attacker that a
 // code was right.
+//
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
 package otp
 
 import (
@@ -272,19 +278,20 @@ type Key struct {
 	Account string
 	// Secret is the shared secret, at least MinSecretSize bytes.
 	Secret []byte
-	// Period is the TOTP time step, a whole number of seconds. It
-	// defaults to DefaultPeriod.
+	// Period is the TOTP time step, a whole number of seconds. 0 means
+	// DefaultPeriod (30 seconds). A negative value is an error.
 	Period time.Duration
-	// Digits is the code length, from MinDigits to MaxDigits. It
-	// defaults to DefaultDigits.
+	// Digits is the code length, from MinDigits to MaxDigits. 0 means
+	// DefaultDigits (6). A negative value is an error.
 	Digits int
 	// SkewSteps is the number of time steps before and after the
 	// current one that Verify also accepts, to tolerate clock drift and
-	// typing time; 1 is common. For VerifyCounter it is the number of
-	// counters after the expected one that are accepted, to resynchronise
-	// a token whose button was pressed without logging in. Each extra
-	// step costs an HMAC per verification and raises the chance that a
-	// guess matches, so keep it small.
+	// typing time; 0 accepts only the current step, and 1 is common.
+	// For VerifyCounter it is the number of counters after the expected
+	// one that are accepted, to resynchronise a token whose button was
+	// pressed without logging in. Each extra step costs an HMAC per
+	// verification and raises the chance that a guess matches, so keep
+	// it small.
 	SkewSteps uint
 	// Counter is the initial HOTP counter of an otpauth URI.
 	Counter uint64

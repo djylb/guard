@@ -111,6 +111,12 @@
 //
 // All durations are measured on the monotonic clock with nanosecond
 // precision, so stepping the wall clock neither lifts nor extends bans.
+//
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
 package failban
 
 import (
@@ -217,34 +223,38 @@ type Config struct {
 	Now func() time.Time
 	// Threshold is the number of failures within Window that bans a
 	// key, and the number of attempts that may be in flight or failed
-	// at once. It defaults to DefaultThreshold and must fit in a uint32,
-	// the size of the failure counts.
+	// at once. 0 means DefaultThreshold (5). It must fit in a uint32,
+	// the size of the failure counts. A negative value is an error.
 	Threshold int
-	// Window is the period over which failures are counted. It
-	// defaults to DefaultWindow.
+	// Window is the period over which failures are counted. 0 means
+	// DefaultWindow (15 minutes). A negative value is an error.
 	Window time.Duration
-	// BanDuration is the length of a first ban. It defaults to
-	// DefaultBanDuration.
+	// BanDuration is the length of a first ban. 0 means
+	// DefaultBanDuration (15 minutes). A negative value is an error.
 	BanDuration time.Duration
-	// MaxBanDuration caps bans that double for repeat offenders. It
-	// defaults to BanDuration, which disables the growth.
+	// MaxBanDuration caps bans that double for repeat offenders. 0
+	// means BanDuration, which disables the growth. It must not be
+	// shorter than BanDuration. A negative value is an error.
 	MaxBanDuration time.Duration
 	// Cooldown is how long after a ban ends the key's offences are
-	// remembered, so that the next ban is longer. It defaults to
-	// MaxBanDuration when bans grow and to zero otherwise.
+	// remembered, so that the next ban is longer. 0 means
+	// MaxBanDuration when bans grow and no cooldown otherwise. A negative
+	// value is an error.
 	Cooldown time.Duration
 	// MaxPending is the maximum number of keys with pending failures or
-	// attempts in flight. It defaults to DefaultMaxPending. Memory grows
-	// with use, by roughly 150 bytes plus the key per counter.
+	// attempts in flight. 0 means DefaultMaxPending (65536); there is no
+	// unlimited setting. Memory grows with use, by roughly 150 bytes plus
+	// the key per counter. A negative value is an error.
 	MaxPending int
 	// MaxBans is the maximum number of ban records, active or in
-	// cooldown. It defaults to DefaultMaxBans.
+	// cooldown. 0 means DefaultMaxBans (65536); there is no unlimited
+	// setting. A negative value is an error.
 	MaxBans int
 	// Shards is the number of independently locked shards, rounded up
 	// to a power of two and lowered so that each shard holds at least
-	// one counter and one ban. It defaults to a multiple of GOMAXPROCS,
+	// one counter and one ban. 0 means a multiple of GOMAXPROCS,
 	// lowered so that each shard holds at least 256 counters and bans.
-	// MaxPending, MaxBans and Full apply per shard.
+	// MaxPending, MaxBans and Full apply per shard. A negative value is an error.
 	Shards int
 	// Full is the policy for a full ban table. It defaults to
 	// LockShard.

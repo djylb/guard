@@ -46,6 +46,12 @@
 // that collide, and a collision by chance would reject a fresh message,
 // never accept a replay. While a nonce is remembered it is rejected with
 // any timestamp, so a protocol must not reuse nonces across timestamps.
+//
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
 package replay
 
 import (
@@ -155,13 +161,16 @@ type Config struct {
 	// Now returns the current time. It defaults to time.Now. A clock
 	// without a monotonic reading makes expiry follow the wall clock.
 	Now func() time.Time
-	// Window is how old a timestamp may be. It must be positive.
+	// Window is how old a timestamp may be. It has no default: 0 and
+	// negative values are an error.
 	Window time.Duration
 	// Skew is how far in the future a timestamp may be, to tolerate
-	// senders whose clocks run ahead. It must not be negative.
+	// senders whose clocks run ahead. 0 means no tolerance: a timestamp
+	// ahead of this clock is rejected. A negative value is an error.
 	Skew time.Duration
 	// Capacity is the number of nonces remembered at most, rounded up to
-	// a multiple of the shard count. It defaults to DefaultCapacity. The
+	// a multiple of the shard count. 0 means DefaultCapacity (65536);
+	// there is no unlimited setting, and a negative value is an error. The
 	// full policy acts per shard, so a shard can be full while the
 	// Window as a whole is not.
 	// Memory grows with the nonces remembered, by about 80 bytes each:
@@ -170,10 +179,11 @@ type Config struct {
 	Capacity int
 	// Shards is the number of independently locked shards, rounded up to
 	// a power of two and lowered so that each shard holds at least one
-	// nonce. It defaults to a multiple of GOMAXPROCS, lowered so that each
+	// nonce. 0 means a multiple of GOMAXPROCS, lowered so that each
 	// shard holds at least 256 nonces; a small Capacity thus gets a single
 	// shard. An explicit count makes each shard hold Capacity/Shards
-	// nonces, and a shard that fills applies Full on its own.
+	// nonces, and a shard that fills applies Full on its own. A negative
+	// value is an error.
 	Shards int
 	// Full is the policy for a full shard. It defaults to ShrinkWindow.
 	Full FullPolicy

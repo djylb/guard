@@ -50,6 +50,12 @@
 // used once on each server and once more after a restart. Deployments
 // with several instances should give them one shared Store, such as a
 // key-value database with an atomic set-if-absent operation.
+//
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
 package pow
 
 import (
@@ -140,16 +146,19 @@ type Config struct {
 	// rotating Key: keep the old key here for one TTL.
 	PreviousKeys [][]byte
 	// Difficulty is the number of leading zero bits Issue asks for,
-	// from 1 to 255. It defaults to DefaultDifficulty.
+	// from 1 to 255. 0 means DefaultDifficulty (18). A negative value is an error.
 	Difficulty int
-	// TTL is how long a challenge stays valid. It defaults to DefaultTTL.
+	// TTL is how long a challenge stays valid, at least a millisecond.
+	// 0 means DefaultTTL (2 minutes). A negative value is an error.
 	TTL time.Duration
 	// Skew is how far ahead of this server's clock the clock of a server
-	// that issued a challenge may run. It defaults to DefaultSkew.
+	// that issued a challenge may run. 0 means DefaultSkew (2 seconds).
+	// A negative value is an error.
 	Skew time.Duration
 	// ReplayCapacity is the capacity of the default Store: the number
-	// of accepted challenges remembered until they expire. It defaults
-	// to DefaultReplayCapacity. Once that many unexpired challenges
+	// of accepted challenges remembered until they expire. 0 means
+	// DefaultReplayCapacity (65536); there is no unlimited setting, and a
+	// negative value is an error. Once that many unexpired challenges
 	// were accepted, older challenges are rejected early as expired.
 	// Memory grows with use, to about 5 MiB at the default; a single
 	// login form can use a few thousand. It is ignored when Store is set.
