@@ -255,6 +255,9 @@ func TestUninitialized(t *testing.T) {
 		if err := w.CheckString(time.Now(), "n"); !errors.Is(err, ErrUninitialized) {
 			t.Error(err)
 		}
+		if err := w.CheckTime(time.Now()); !errors.Is(err, ErrUninitialized) {
+			t.Error(err)
+		}
 		if w.Stats() != (Stats{}) {
 			t.Error("nil or zero window reports entries")
 		}
@@ -442,5 +445,35 @@ func TestConfigJSONRoundTrip(t *testing.T) {
 	}
 	if _, err := json.Marshal(Config{Full: FullPolicy(9)}); err == nil {
 		t.Error("unknown policy marshalled")
+	}
+}
+
+func TestCheckTime(t *testing.T) {
+	clk := newFakeClock()
+	w := mustNew(t, Config{Now: clk.Now, Window: time.Minute, Skew: 5 * time.Second, Capacity: 64})
+	now := clk.Now()
+	for _, tc := range []struct {
+		ts   time.Time
+		want error
+	}{
+		{now, nil},
+		{now.Add(-time.Minute), nil},
+		{now.Add(5 * time.Second), nil},
+		{now.Add(-time.Minute - 1), ErrStale},
+		{now.Add(5*time.Second + 1), ErrFuture},
+	} {
+		if err := w.CheckTime(tc.ts); !errors.Is(err, tc.want) {
+			t.Errorf("CheckTime(%v) = %v, want %v", tc.ts, err, tc.want)
+		}
+	}
+	// CheckTime remembers nothing.
+	if err := w.CheckTime(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Check(now, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() { _ = w.CheckTime(now.Add(time.Hour)) }); n != 0 {
+		t.Fatalf("CheckTime allocates %v times", n)
 	}
 }

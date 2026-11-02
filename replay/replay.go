@@ -338,8 +338,19 @@ func (w *Window) CheckString(ts time.Time, nonce string) error {
 	return w.check(ts, key{maphash.String(w.seeds[0], nonce), maphash.String(w.seeds[1], nonce)})
 }
 
-func (w *Window) check(ts time.Time, k key) error {
-	now, mono := w.clock.Read()
+// CheckTime returns ErrStale or ErrFuture when ts lies outside the
+// window, as Check would, and nil otherwise. It remembers nothing, so a
+// message can be rejected by its timestamp before the work of
+// authenticating it; Check is still needed afterwards.
+func (w *Window) CheckTime(ts time.Time) error {
+	if w == nil || w.shards == nil {
+		return ErrUninitialized
+	}
+	now, _ := w.clock.Read()
+	return w.checkTime(ts, now)
+}
+
+func (w *Window) checkTime(ts, now time.Time) error {
 	// Time.Sub saturates, so extreme timestamps cannot overflow.
 	d := ts.Sub(now)
 	if d > w.skew {
@@ -347,6 +358,14 @@ func (w *Window) check(ts time.Time, k key) error {
 	}
 	if d < -w.window {
 		return ErrStale
+	}
+	return nil
+}
+
+func (w *Window) check(ts time.Time, k key) error {
+	now, mono := w.clock.Read()
+	if err := w.checkTime(ts, now); err != nil {
+		return err
 	}
 	tsOff := w.clock.Wall(ts)
 	s := &w.shards[k[0]&w.mask]

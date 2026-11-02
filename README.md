@@ -92,6 +92,9 @@ if err := w.Check(msg.Time, msg.Nonce); err != nil {
 - Nonces are identified by a 128-bit keyed hash, so a check does not
   allocate. While a nonce is remembered, it is rejected with any
   timestamp.
+- **Cheap early rejection.** `CheckTime` tests only the timestamp and
+  remembers nothing, so a stale message can be dropped before the work of
+  authenticating it; `Check` still follows.
 - **Observability.** `Stats` reports the nonces remembered, the capacity,
   and how many nonces `ShrinkWindow` forgot early: if that grows,
   `Capacity` is too small for the load.
