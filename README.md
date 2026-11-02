@@ -257,7 +257,9 @@ user.Succeed() // clears the account's failures
 - **Observability.** `Stats` returns sizes (pending, banned, cooling,
   waiting, locked shards) and counters (failures, bans started, attempts
   refused, bans evicted). `Failures` returns a key's count, zero while it
-  is reported banned. `Unban` and `Reset` are for administrators.
+  is reported banned. `Pending` lists the keys with failures but no ban,
+  with their counts and the time of their newest failure, for an admin
+  page. `Unban` and `Reset` are for administrators.
 
 Key IPv6 clients by prefix (`/64` or `/56`), not by single address: a
 single host may hold billions of addresses. A single `/48` holds 65536

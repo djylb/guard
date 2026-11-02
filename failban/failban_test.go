@@ -951,3 +951,39 @@ func TestNewNamesNegativeField(t *testing.T) {
 		t.Fatalf("New = %v", err)
 	}
 }
+
+func TestPending(t *testing.T) {
+	clk := newFakeClock()
+	l := newTest(t, clk, Config{Threshold: 3, Window: time.Minute, BanDuration: time.Hour})
+	l.Fail("a")
+	clk.Advance(time.Second)
+	l.Fail("a")
+	clk.Advance(time.Second)
+	l.Fail("b")
+	for range 3 {
+		l.Fail("c") // banned: not pending
+	}
+	a := l.Attempt("d") // in flight only: not pending
+	defer a.Release()
+	want := []Pending[string]{
+		{Key: "b", Failures: 1, Last: clk.Now()},
+		{Key: "a", Failures: 2, Last: clk.Now().Add(-time.Second)},
+	}
+	got := l.Pending()
+	if len(got) != len(want) {
+		t.Fatalf("Pending = %+v", got)
+	}
+	for i := range want {
+		if got[i].Key != want[i].Key || got[i].Failures != want[i].Failures || !got[i].Last.Equal(want[i].Last) {
+			t.Fatalf("Pending = %+v, want %+v", got, want)
+		}
+	}
+	clk.Advance(2 * time.Minute)
+	if got := l.Pending(); len(got) != 0 {
+		t.Fatalf("Pending after the window = %+v", got)
+	}
+	var zero Limiter[string]
+	if zero.Pending() != nil {
+		t.Fatal("zero Limiter has pending keys")
+	}
+}

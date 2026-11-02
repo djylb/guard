@@ -407,6 +407,7 @@ type counter[K comparable] struct {
 	prev, next *counter[K] // recency list, without waiting counters; the shard's root is the sentinel
 	slots      []slot      // reservations; in use or on the free list
 	newest     int64       // bucket index of the newest bucket
+	last       int64       // time of the newest failure
 	inflight   uint64      // slots in use
 	offences   int         // of a ban EvictSoonest ended early
 	free       int         // 1 + index of the first free slot; 0 if none
@@ -758,6 +759,7 @@ func (s *shard[K]) fail(l *Limiter[K], key K, t int64) Result {
 		return Result{Until: l.at(s.lockdown()), Banned: true}
 	}
 	c.add(i)
+	c.last = t
 	s.failures++
 	if c.waiting || c.count(i) >= l.threshold {
 		if r == nil && !s.room(l, t) {
@@ -1115,6 +1117,48 @@ func (l *Limiter[K]) Bans() []Ban[K] {
 		s.mu.RUnlock()
 	}
 	slices.SortFunc(list, func(a, b Ban[K]) int { return a.Until.Compare(b.Until) })
+	return list
+}
+
+// Pending is a key with failures counted in the window but no ban, as
+// Limiter.Pending lists them.
+type Pending[K comparable] struct {
+	// Key is the key.
+	Key K
+	// Failures is the number of failures counted in the current window.
+	Failures int
+	// Last is the time of the key's newest failure.
+	Last time.Time
+}
+
+// Pending returns the keys with failures counted in the current window
+// that are not banned, newest failure first, for display. Keys with only
+// attempts in flight, and keys reported banned, are left out. It never
+// changes the Limiter.
+func (l *Limiter[K]) Pending() []Pending[K] {
+	if !l.ready() {
+		return nil
+	}
+	t := l.clock.Mono()
+	i := l.bucket(t)
+	var list []Pending[K]
+	for j := range l.shards {
+		s := &l.shards[j]
+		s.mu.RLock()
+		for _, c := range s.counters {
+			if c.waiting {
+				continue
+			}
+			if _, banned := s.bannedUntil(l, c.key, t); banned {
+				continue
+			}
+			if n := c.count(i); n > 0 {
+				list = append(list, Pending[K]{Key: c.key, Failures: int(min(n, math.MaxInt32)), Last: l.at(c.last)})
+			}
+		}
+		s.mu.RUnlock()
+	}
+	slices.SortFunc(list, func(a, b Pending[K]) int { return b.Last.Compare(a.Last) })
 	return list
 }
 
