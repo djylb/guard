@@ -87,8 +87,8 @@ func Decode(data []byte, v any) error {
 func tags(v any) []string {
 	t := reflect.TypeOf(v).Elem()
 	names := make([]string, 0, t.NumField())
-	for i := range t.NumField() {
-		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+	for field := range t.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if name != "" && name != "-" {
 			names = append(names, name)
 		}

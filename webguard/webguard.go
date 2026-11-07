@@ -89,6 +89,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/textproto"
+	"slices"
 	"strings"
 
 	"github.com/djylb/guard/internal/addr"
@@ -441,8 +442,8 @@ func (g *Guard) clientAddr(r *http.Request) (netip.Addr, bool, error) {
 		return a, false, nil
 	}
 	values := r.Header[g.forwarded]
-	for i := len(values) - 1; i >= 0; i-- {
-		list := values[i]
+	for _, list := range slices.Backward(values) {
+
 		for list != "" {
 			hop := list
 			if j := strings.LastIndexByte(list, ','); j >= 0 {
