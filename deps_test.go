@@ -10,7 +10,8 @@ import (
 
 // TestPackageDependencies checks what the README promises: every package
 // depends on the standard library alone, apart from pow on replay and
-// shared internal helpers, and only webguard links net/http.
+// shared internal helpers, and only webguard links net/http. The tests of
+// every package may use the internal leak check.
 func TestPackageDependencies(t *testing.T) {
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("cannot run the go command")
@@ -22,8 +23,10 @@ func TestPackageDependencies(t *testing.T) {
 	const module = "github.com/djylb/guard"
 	const internal = module + "/internal/"
 	addr, clock, conf, num, race, sign := internal+"addr", internal+"clock", internal+"conf", internal+"num", internal+"race", internal+"sign"
+	leakcheck := internal + "leakcheck"
 	allowed := map[string][]string{
 		module:               nil,
+		leakcheck:            nil,
 		addr:                 nil,
 		clock:                nil,
 		conf:                 nil,
@@ -55,7 +58,7 @@ func TestPackageDependencies(t *testing.T) {
 			path, std, _ := strings.Cut(strings.TrimSpace(line), " ")
 			path, _, _ = strings.Cut(path, " ") // "pkg [pkg.test]"
 			switch {
-			case path == pkg || path == pkg+".test" || strings.HasPrefix(path, pkg+"_test"):
+			case path == pkg || path == pkg+".test" || strings.HasPrefix(path, pkg+"_test"), path == leakcheck:
 			case path == "net/http" && pkg != module+"/webguard":
 				t.Errorf("%s links net/http", pkg)
 			case strings.HasPrefix(path, module):
