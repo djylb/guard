@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/djylb/guard/webguard"
 )
@@ -40,8 +41,13 @@ func Example() {
 		// Reached only by same-origin requests with a valid token.
 	})
 
-	srv := &http.Server{Addr: "127.0.0.1:8080", Handler: g.Handler(csrf.Handler(sessionID, mux))}
-	_ = srv // srv.ListenAndServe()
+	srv := &http.Server{
+		Addr:              "127.0.0.1:8080",
+		Handler:           g.Handler(csrf.Handler(sessionID, mux)),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	_ = srv.ListenAndServe // srv.ListenAndServe() serves it
+	// Output:
 }
 
 // An admin page behind a reverse proxy, open to one network.

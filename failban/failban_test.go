@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,21 +27,21 @@ func newFakeClock() *fakeClock {
 func (c *fakeClock) Now() time.Time          { return time.Unix(0, c.ns.Load()) }
 func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
 
-func newTest(t testing.TB, clk *fakeClock, c Config) *Limiter[string] {
-	t.Helper()
+func newTest(tb testing.TB, clk *fakeClock, c Config) *Limiter[string] {
+	tb.Helper()
 	c.Now = clk.Now
 	l, err := New[string](c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return l
 }
 
-func mustNew[K comparable](t testing.TB, c Config) *Limiter[K] {
-	t.Helper()
+func mustNew[K comparable](tb testing.TB, c Config) *Limiter[K] {
+	tb.Helper()
 	l, err := New[K](c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return l
 }
@@ -140,10 +141,10 @@ func TestWindowCoverage(t *testing.T) {
 func TestGrowth(t *testing.T) {
 	clk := newFakeClock()
 	l := newTest(t, clk, Config{Threshold: 1, BanDuration: time.Minute, MaxBanDuration: 5 * time.Minute, Cooldown: time.Hour})
-	for i, want := range []time.Duration{1, 2, 4, 5, 5} {
+	for i, want := range []int{1, 2, 4, 5, 5} {
 		until, banned := ub(l.Fail("u"))
-		if !banned || until.Sub(clk.Now()) != want*time.Minute {
-			t.Fatalf("ban %d: %v, want %v", i+1, until.Sub(clk.Now()), want*time.Minute)
+		if !banned || until.Sub(clk.Now()) != time.Duration(want)*time.Minute {
+			t.Fatalf("ban %d: %v, want %v", i+1, until.Sub(clk.Now()), time.Duration(want)*time.Minute)
 		}
 		clk.Advance(until.Sub(clk.Now()))
 	}
@@ -377,7 +378,7 @@ func TestBansOrder(t *testing.T) {
 	clk := newFakeClock()
 	l := newTest(t, clk, Config{Threshold: 1, BanDuration: time.Hour})
 	for i := range 20 {
-		l.Fail(fmt.Sprint(i))
+		l.Fail(strconv.Itoa(i))
 		clk.Advance(time.Second)
 	}
 	bans := l.Bans()
@@ -385,7 +386,7 @@ func TestBansOrder(t *testing.T) {
 		t.Fatalf("%d bans", len(bans))
 	}
 	for i, b := range bans {
-		if b.Key != fmt.Sprint(i) || b.Offences != 1 {
+		if b.Key != strconv.Itoa(i) || b.Offences != 1 {
 			t.Fatalf("ban %d = %+v", i, b)
 		}
 	}
@@ -448,6 +449,7 @@ func TestConcurrent(t *testing.T) {
 }
 
 func testConcurrent(t *testing.T, full FullPolicy) {
+	t.Helper()
 	l := mustNew[int](t, Config{Threshold: 3, MaxPending: 32, MaxBans: 16, Full: full})
 	var wg sync.WaitGroup
 	for g := range 8 {
@@ -872,7 +874,9 @@ func TestConfigJSONRoundTrip(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(c) {
 		t.Fatalf("%s -> %+v", b, got)
 	}
-	if b, err := json.Marshal(struct{ P PrefixLen }{PrefixLen{V4: 24, V6: 48}}); err != nil || string(b) != `{"P":{"v4":24,"v6":48}}` {
+	if b, err := json.Marshal(struct {
+		P PrefixLen `json:"p"`
+	}{PrefixLen{V4: 24, V6: 48}}); err != nil || string(b) != `{"p":{"v4":24,"v6":48}}` {
 		t.Fatalf("PrefixLen JSON %s, %v", b, err)
 	}
 }

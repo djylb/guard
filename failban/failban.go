@@ -508,7 +508,7 @@ func New[K comparable](c Config) (*Limiter[K], error) {
 		return nil, fmt.Errorf("%w: unknown %v", ErrInvalidConfig, c.Full)
 	}
 	threshold := orDefault(c.Threshold, DefaultThreshold)
-	if uint64(threshold) > math.MaxUint32 {
+	if num.U64(threshold) > math.MaxUint32 {
 		return nil, fmt.Errorf("%w: Threshold %d exceeds the failure counts", ErrInvalidConfig, threshold)
 	}
 	window := orDefault(c.Window, DefaultWindow)
@@ -532,8 +532,8 @@ func New[K comparable](c Config) (*Limiter[K], error) {
 		ban:       int64(ban),
 		maxBan:    int64(maxBan),
 		cooldown:  int64(cooldown),
-		mask:      uint64(n - 1),
-		threshold: uint64(threshold),
+		mask:      num.U64(n - 1),
+		threshold: num.U64(threshold),
 		full:      c.Full,
 	}
 	for i := range l.shards {
@@ -547,6 +547,7 @@ func New[K comparable](c Config) (*Limiter[K], error) {
 	return l, nil
 }
 
+//nolint:ireturn // T is a number type, not an interface
 func orDefault[T int | time.Duration](v, def T) T {
 	if v == 0 {
 		return def
@@ -913,7 +914,7 @@ func (s *shard[K]) keepOffences(l *Limiter[K], r *record[K], t int64) {
 	i := l.bucket(t)
 	c := s.newCounter(r.key, i)
 	c.offences = r.offences
-	c.counts[uint64(i)%buckets] = uint32(min(l.threshold-1, math.MaxUint32))
+	c.counts[num.U64(i)%buckets] = uint32(min(l.threshold-1, math.MaxUint32))
 	s.counters[r.key] = c
 	c.linkAfter(&s.root)
 }
@@ -1287,13 +1288,13 @@ func (c *counter[K]) add(i int64) {
 			c.counts = [buckets]uint32{}
 		} else {
 			for j := c.newest + 1; j <= i; j++ {
-				c.counts[uint64(j)%buckets] = 0
+				c.counts[num.U64(j)%buckets] = 0
 			}
 		}
 		c.newest = i
 	}
 	// A clock that went back counts in the newest bucket.
-	if b := &c.counts[uint64(c.newest)%buckets]; *b < math.MaxUint32 {
+	if b := &c.counts[num.U64(c.newest)%buckets]; *b < math.MaxUint32 {
 		*b++
 	}
 }
@@ -1302,7 +1303,7 @@ func (c *counter[K]) add(i int64) {
 func (c *counter[K]) count(i int64) uint64 {
 	var n uint64
 	for j := max(c.newest-buckets+1, i-buckets+1); j <= c.newest; j++ {
-		n += uint64(c.counts[uint64(j)%buckets])
+		n += uint64(c.counts[num.U64(j)%buckets])
 	}
 	return n
 }

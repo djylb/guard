@@ -110,7 +110,8 @@ func (s *Signer) Verify(tag, header []byte, fields ...string) bool {
 
 func (p *keyPool) tag(domain string, header []byte, fields []string) [Size]byte {
 	st, _ := p.pool.Get().(*state)
-	m := append(st.msg[:0], domain...)
+	m := st.msg[:0]
+	m = append(m, domain...)
 	m = append(m, 0)
 	m = append(m, header...)
 	for _, f := range fields {

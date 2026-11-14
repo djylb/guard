@@ -39,7 +39,7 @@ func DecodeSecret(s string) ([]byte, error) {
 		s = data
 	}
 	upper := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c >= 'A' && c <= 'Z', c >= '2' && c <= '7':
@@ -139,8 +139,8 @@ func ParseURI(uri string) (*Key, error) {
 		return nil, ErrInvalidURI
 	}
 	rest, rawQuery, _ := strings.Cut(uri[len(scheme):], "?")
-	typ, label, ok := strings.Cut(rest, "/")
-	if !ok {
+	typ, label, hasLabel := strings.Cut(rest, "/")
+	if !hasLabel {
 		return nil, fmt.Errorf("%w: no label", ErrInvalidURI)
 	}
 	k := &Key{}
@@ -198,53 +198,61 @@ func ParseURI(uri string) (*Key, error) {
 	if k.Secret, err = DecodeSecret(secret); err != nil {
 		return nil, err
 	}
-	if v, ok, err := get("issuer"); err != nil {
+	v, set, err := get("issuer")
+	if err != nil {
 		return nil, err
-	} else if ok {
+	}
+	if set {
 		if hasIssuer && v != k.Issuer {
 			return nil, fmt.Errorf("%w: issuer %q differs from label issuer %q", ErrInvalidURI, v, k.Issuer)
 		}
 		k.Issuer = v
 	}
-	if v, ok, err := get("algorithm"); err != nil {
+	v, set, err = get("algorithm")
+	if err != nil {
 		return nil, err
-	} else if ok {
+	}
+	if set {
 		if k.Algorithm, err = ParseAlgorithm(v); err != nil {
 			return nil, fmt.Errorf("%w: algorithm %q", ErrInvalidURI, v)
 		}
 	}
-	if v, ok, err := get("digits"); err != nil {
+	v, set, err = get("digits")
+	if err != nil {
 		return nil, err
-	} else if ok {
+	}
+	if set {
 		n, ok := parseDecimal(v)
 		if !ok || n < MinDigits || n > MaxDigits {
 			return nil, fmt.Errorf("%w: digits %q", ErrInvalidURI, v)
 		}
 		k.Digits = int(n)
 	}
-	if v, ok, err := get("period"); err != nil {
+	v, set, err = get("period")
+	if err != nil {
 		return nil, err
-	} else if ok {
+	}
+	if set {
 		n, ok := parseDecimal(v)
 		if !ok || n == 0 || n > uint64(1<<63-1)/uint64(time.Second) {
 			return nil, fmt.Errorf("%w: period %q", ErrInvalidURI, v)
 		}
 		k.Period = time.Duration(n) * time.Second
 	}
-	v, ok, err := get("counter")
+	v, set, err = get("counter")
 	if err != nil {
 		return nil, err
 	}
 	switch k.Kind {
 	case HOTP:
 		n, valid := parseDecimal(v)
-		if !ok || !valid {
+		if !set || !valid {
 			return nil, fmt.Errorf("%w: counter %q", ErrInvalidURI, v)
 		}
 		k.Counter = n
 	case TOTP:
 	}
-	if err := k.Validate(); err != nil {
+	if err = k.Validate(); err != nil {
 		return nil, err
 	}
 	return k, nil
@@ -257,7 +265,7 @@ func parseDecimal(s string) (uint64, bool) {
 		return 0, false
 	}
 	var n uint64
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c < '0' || c > '9' {
 			return 0, false

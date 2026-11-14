@@ -32,20 +32,20 @@ func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
 
 var testKey = []byte("0123456789abcdef0123456789abcdef")
 
-func mustCSRF(t testing.TB, c CSRFConfig) *CSRF {
-	t.Helper()
+func mustCSRF(tb testing.TB, c CSRFConfig) *CSRF {
+	tb.Helper()
 	x, err := NewCSRF(c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return x
 }
 
-func newCSRF(t testing.TB, clk *fakeClock) *CSRF {
-	t.Helper()
+func newCSRF(tb testing.TB, clk *fakeClock) *CSRF {
+	tb.Helper()
 	x, err := NewCSRF(CSRFConfig{Now: clk.Now, Key: testKey, MaxAge: time.Hour})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return x
 }
@@ -181,7 +181,7 @@ func TestCSRFHandler(t *testing.T) {
 			r.Header.Set("X-Session", tt.session)
 		}
 		if tt.header != "" {
-			r.Header.Set(DefaultCSRFHeader, tt.header)
+			r.Header.Set(DefaultCSRFHeader, tt.header) //nolint:canonicalheader // the constant keeps the conventional CSRF spelling; Header canonicalises it
 		}
 		if tt.ctype != "" {
 			r.Header.Set("Content-Type", tt.ctype)
@@ -298,7 +298,7 @@ func TestCSRFHandlerAllocs(t *testing.T) {
 	tok, _ := x.Token("s1")
 	w := httptest.NewRecorder()
 	ok := httptest.NewRequest(http.MethodPost, "http://localhost/x", nil)
-	ok.Header.Set("x-csrf-token", tok)
+	ok.Header.Set("x-csrf-token", tok) //nolint:canonicalheader // the lower-case spelling is the point: header names match case-insensitively
 	missing := httptest.NewRequest(http.MethodPost, "http://localhost/x", nil)
 	missing.Header.Set("Content-Type", "application/json; charset=utf-8")
 	quiet := mustCSRF(t, CSRFConfig{Now: clk.Now, Key: testKey, Deny: func(http.ResponseWriter, *http.Request, error) {}})

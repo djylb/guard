@@ -17,6 +17,13 @@ func SatAdd(a, b int64) int64 {
 	return a + b
 }
 
+// U64 returns x as an unsigned number. A negative x wraps around, which
+// is what callers that index a ring of buckets by an integer time rely on;
+// the others pass values they have checked to be non-negative.
+func U64[T ~int | ~int64](x T) uint64 {
+	return uint64(x)
+}
+
 // CeilPow2 returns the smallest power of two that is at least n, and 1
 // for n below 1.
 func CeilPow2(n int) int {

@@ -54,7 +54,7 @@ package otp
 
 import (
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: HOTP and TOTP define HMAC-SHA1 (RFC 4226), the default algorithm of authenticator apps
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
@@ -175,7 +175,7 @@ func (a Algorithm) sizes() (block, digest int) {
 func (a Algorithm) sum(out *[sha512.Size]byte, b []byte) []byte {
 	switch a {
 	case SHA1:
-		d := sha1.Sum(b)
+		d := sha1.Sum(b) //nolint:gosec // G401: as for the import
 		return out[:copy(out[:], d[:])]
 	case SHA256:
 		d := sha256.Sum256(b)
@@ -519,7 +519,7 @@ func wellFormed(code string, digits int) bool {
 	if len(code) != digits {
 		return false
 	}
-	for i := 0; i < len(code); i++ {
+	for i := range len(code) {
 		if code[i] < '0' || code[i] > '9' {
 			return false
 		}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/djylb/guard/internal/conf"
+	"github.com/djylb/guard/internal/num"
 	"github.com/djylb/guard/internal/sign"
 )
 
@@ -243,8 +244,8 @@ func (x *CSRF) Verify(token, session string) error {
 	}
 	issued := binary.BigEndian.Uint64(raw[1:9])
 	now := x.now().UnixMilli()
-	if now < 0 || issued > uint64(now)+uint64(x.skew.Milliseconds()) ||
-		(uint64(now) > issued && uint64(now)-issued > uint64(x.maxAge.Milliseconds())) {
+	if now < 0 || issued > num.U64(now)+num.U64(x.skew.Milliseconds()) ||
+		(num.U64(now) > issued && num.U64(now)-issued > num.U64(x.maxAge.Milliseconds())) {
 		return errCSRFExpired
 	}
 	return nil

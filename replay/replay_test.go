@@ -26,11 +26,11 @@ func newFakeClock() *fakeClock {
 func (c *fakeClock) Now() time.Time          { return time.Unix(0, c.ns.Load()) }
 func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
 
-func mustNew(t testing.TB, c Config) *Window {
-	t.Helper()
+func mustNew(tb testing.TB, c Config) *Window {
+	tb.Helper()
 	w, err := New(c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return w
 }

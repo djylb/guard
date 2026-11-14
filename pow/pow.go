@@ -71,6 +71,7 @@ import (
 	"time"
 
 	"github.com/djylb/guard/internal/conf"
+	"github.com/djylb/guard/internal/num"
 	"github.com/djylb/guard/internal/sign"
 	"github.com/djylb/guard/replay"
 )
@@ -315,7 +316,7 @@ func (c *Challenger) IssueDifficulty(difficulty int, binding ...string) (string,
 	if err := checkDifficulty(difficulty); err != nil {
 		return "", err
 	}
-	return c.issue(uint8(difficulty), binding), nil
+	return c.issue(uint8(difficulty), binding), nil //nolint:gosec // G115: checkDifficulty above bounds it to 1..255
 }
 
 func (c *Challenger) issue(difficulty uint8, binding []string) string {
@@ -351,7 +352,7 @@ func (c *Challenger) Verify(token string, solution uint64, binding ...string) er
 	if exp < nowMs {
 		return ErrExpired
 	}
-	if uint64(exp)-uint64(nowMs) > uint64((c.ttl+c.skew).Milliseconds())+1 {
+	if num.U64(exp)-num.U64(nowMs) > num.U64((c.ttl+c.skew).Milliseconds())+1 {
 		// Issued further ahead than the skew allows: by a server
 		// whose clock runs ahead, or with a longer TTL.
 		return ErrNotYetValid

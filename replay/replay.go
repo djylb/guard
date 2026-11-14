@@ -299,7 +299,7 @@ func New(c Config) (*Window, error) {
 		window: c.Window,
 		skew:   c.Skew,
 		retain: num.SatAdd(int64(c.Window), int64(c.Skew)),
-		mask:   uint64(n - 1),
+		mask:   num.U64(n - 1),
 		full:   c.Full,
 	}
 	for i := range w.shards {

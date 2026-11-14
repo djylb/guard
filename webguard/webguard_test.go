@@ -16,11 +16,11 @@ var okHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 })
 
-func mustGuard(t testing.TB, c Config) *Guard {
-	t.Helper()
+func mustGuard(tb testing.TB, c Config) *Guard {
+	tb.Helper()
 	g, err := New(c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return g
 }
@@ -596,7 +596,7 @@ func TestConfigMarshalJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got Config
-	if err := json.Unmarshal(b, &got); err != nil || got.Hosts[0] != "a" || got.TrustedProxies[0] != "10.0.0.1" || !got.LoopbackPeers {
+	if err = json.Unmarshal(b, &got); err != nil || got.Hosts[0] != "a" || got.TrustedProxies[0] != "10.0.0.1" || !got.LoopbackPeers {
 		t.Fatalf("%s -> %+v, %v", b, got, err)
 	}
 	b, err = json.Marshal(CSRFConfig{Key: testKey, PreviousKeys: [][]byte{testKey}, Skew: time.Second})

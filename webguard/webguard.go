@@ -514,7 +514,7 @@ func validToken(s string) bool {
 	if s == "" {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
@@ -604,8 +604,8 @@ func splitHost(h string, bareIPv6 bool) (host, port string, ok bool) {
 		if end < 0 {
 			return "", "", false
 		}
-		host, rest := h[1:end], h[end+1:]
-		if a, err := netip.ParseAddr(host); err != nil || !a.Is6() || a.Zone() != "" {
+		addr, rest := h[1:end], h[end+1:]
+		if a, err := netip.ParseAddr(addr); err != nil || !a.Is6() || a.Zone() != "" {
 			return "", "", false
 		}
 		if rest != "" {
@@ -614,7 +614,7 @@ func splitHost(h string, bareIPv6 bool) (host, port string, ok bool) {
 			}
 			port = rest[1:]
 		}
-		return host, port, true
+		return addr, port, true
 	}
 	host = h
 	if i := strings.LastIndexByte(h, ':'); i >= 0 {
@@ -627,7 +627,7 @@ func splitHost(h string, bareIPv6 bool) (host, port string, ok bool) {
 	if host == "" {
 		return "", "", false
 	}
-	for i := 0; i < len(host); i++ {
+	for i := range len(host) {
 		c := host[i]
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '.', c == '_':
@@ -643,7 +643,7 @@ func validPort(p string) bool {
 		return false
 	}
 	n := 0
-	for i := 0; i < len(p); i++ {
+	for i := range len(p) {
 		if p[i] < '0' || p[i] > '9' {
 			return false
 		}

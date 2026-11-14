@@ -33,41 +33,41 @@ func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
 
 var testKey = []byte("0123456789abcdef0123456789abcdef")
 
-func mustNew(t testing.TB, c Config) *Challenger {
-	t.Helper()
+func mustNew(tb testing.TB, c Config) *Challenger {
+	tb.Helper()
 	ch, err := New(c)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return ch
 }
 
-func newTest(t testing.TB, clk *fakeClock, difficulty int) *Challenger {
-	t.Helper()
+func newTest(tb testing.TB, clk *fakeClock, difficulty int) *Challenger {
+	tb.Helper()
 	c, err := New(Config{Now: clk.Now, Key: testKey, Difficulty: difficulty, TTL: time.Minute, ReplayCapacity: 64})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return c
 }
 
-func solve(t testing.TB, token string) uint64 {
-	t.Helper()
+func solve(tb testing.TB, token string) uint64 {
+	tb.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	s, err := Solve(ctx, token)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return s
 }
 
 // unsolved returns a solution that does not meet token's difficulty.
-func unsolved(t testing.TB, token string) uint64 {
-	t.Helper()
+func unsolved(tb testing.TB, token string) uint64 {
+	tb.Helper()
 	for s := uint64(0); ; s++ {
 		if ok, err := Check(token, s); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		} else if !ok {
 			return s
 		}
@@ -374,7 +374,7 @@ func TestConfigJSON(t *testing.T) {
 		c.ReplayCapacity != 4096 || c.Difficulty != 20 {
 		t.Fatalf("got %+v", c)
 	}
-	for _, bad := range []string{`{"ttl":120}`, `{"key":"!"}`, `{"dificulty":3}`, `{"key":null}`, `{"ttl":null}`, `{"key":""}`} {
+	for _, bad := range []string{`{"ttl":120}`, `{"key":"!"}`, `{"difficulty_":3}`, `{"key":null}`, `{"ttl":null}`, `{"key":""}`} {
 		if err := json.Unmarshal([]byte(bad), &c); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%s: %v", bad, err)
 		}
@@ -602,11 +602,11 @@ func TestMemoryStoreShared(t *testing.T) {
 	}
 }
 
-func mustParse(t testing.TB, token string) Challenge {
-	t.Helper()
+func mustParse(tb testing.TB, token string) Challenge {
+	tb.Helper()
 	ch, err := Parse(token)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return ch
 }
@@ -753,10 +753,13 @@ func TestConfigMarshalJSON(t *testing.T) {
 		t.Fatalf("secret written: %s, %v", b, err)
 	}
 	var c Config
-	if err := json.Unmarshal(b, &c); err == nil {
+	if err = json.Unmarshal(b, &c); err == nil {
 		t.Fatal("config without a key decoded")
 	}
-	b, _ = json.Marshal(Config{TTL: time.Minute})
+	b, err = json.Marshal(Config{TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := json.Unmarshal(b, &c); err != nil || c.Key != nil || c.TTL != time.Minute {
 		t.Fatalf("%s: %+v, %v", b, c, err)
 	}

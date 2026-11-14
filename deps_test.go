@@ -37,9 +37,9 @@ func TestPackageDependencies(t *testing.T) {
 		module + "/pow":      {module + "/replay", clock, conf, num, race, sign},
 		module + "/failban":  {addr, clock, conf, num},
 		module + "/otp":      {conf},
-		module + "/webguard": {addr, conf, race, sign},
+		module + "/webguard": {addr, conf, num, race, sign},
 	}
-	listed, err := exec.Command(goCmd, "list", module+"/...").Output()
+	listed, err := exec.CommandContext(t.Context(), goCmd, "list", module+"/...").Output()
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestPackageDependencies(t *testing.T) {
 	}
 	for pkg, internal := range allowed {
 		// -test includes the dependencies of the package's tests.
-		out, err := exec.Command(goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", pkg).Output()
+		out, err := exec.CommandContext(t.Context(), goCmd, "list", "-deps", "-test", "-f", "{{.ImportPath}} {{.Standard}}", pkg).Output()
 		if err != nil {
 			t.Fatalf("go list %s: %v", pkg, err)
 		}

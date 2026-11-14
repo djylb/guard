@@ -26,7 +26,11 @@ func TestAttemptConcurrentSlowChecks(t *testing.T) {
 			}
 			checked.Add(1)
 			n := running.Add(1)
-			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
 			}
 			time.Sleep(10 * time.Millisecond) // a slow password hash
 			running.Add(-1)

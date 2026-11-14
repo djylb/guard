@@ -3,7 +3,7 @@ package otp
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: the reference implementation the RFC vectors are checked against
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
@@ -275,7 +275,7 @@ func TestURIRoundTrip(t *testing.T) {
 		{Issuer: "Example Co", Account: "alice@example.com", Secret: rfcSHA1},
 		{Account: "bob", Secret: rfcSHA256, Algorithm: SHA256, Digits: 8, Period: time.Minute},
 		{Issuer: "a:b/c?d&e=f g+h%", Account: "x:y/z", Secret: rfcSHA512, Algorithm: SHA512, Kind: HOTP, Counter: 42},
-		{Issuer: "日本", Account: "ü", Secret: rfcSHA1, Kind: HOTP},
+		{Issuer: "日本", Account: "ü", Secret: rfcSHA1, Kind: HOTP}, //nolint:gosmopolitan // non-ASCII labels are what the test encodes
 	}
 	for _, k := range keys {
 		uri, err := k.URI()
@@ -392,7 +392,7 @@ func FuzzParseURI(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if err := k.Validate(); err != nil {
+		if err = k.Validate(); err != nil {
 			t.Fatalf("ParseURI(%q) returned an invalid key: %v", s, err)
 		}
 		uri, err := k.URI()
@@ -449,7 +449,7 @@ func TestGeneratorMatchesHMAC(t *testing.T) {
 	news := map[Algorithm]func() hash.Hash{SHA1: sha1.New, SHA256: sha256.New, SHA512: sha512.New}
 	for alg, newHash := range news {
 		for _, size := range []int{16, 20, 63, 64, 65, 127, 128, 129, 300} {
-			secret := bytes.Repeat([]byte{byte(size), 0xa5}, size)[:size]
+			secret := bytes.Repeat([]byte{byte(size & 0xff), 0xa5}, size)[:size]
 			k := &Key{Secret: secret, Algorithm: alg, Digits: 8, Kind: HOTP}
 			for _, c := range []uint64{0, 1, 1 << 40} {
 				m := hmac.New(newHash, secret)
