@@ -604,8 +604,8 @@ func splitHost(h string, bareIPv6 bool) (host, port string, ok bool) {
 		if end < 0 {
 			return "", "", false
 		}
-		addr, rest := h[1:end], h[end+1:]
-		if a, err := netip.ParseAddr(addr); err != nil || !a.Is6() || a.Zone() != "" {
+		ip, rest := h[1:end], h[end+1:]
+		if a, err := netip.ParseAddr(ip); err != nil || !a.Is6() || a.Zone() != "" {
 			return "", "", false
 		}
 		if rest != "" {
@@ -614,7 +614,7 @@ func splitHost(h string, bareIPv6 bool) (host, port string, ok bool) {
 			}
 			port = rest[1:]
 		}
-		return addr, port, true
+		return ip, port, true
 	}
 	host = h
 	if i := strings.LastIndexByte(h, ':'); i >= 0 {
