@@ -432,7 +432,7 @@ func FuzzClientAddr(f *testing.F) {
 			t.Fatalf("ClientAddr(%q, %q) = %v", remote, xff, addr)
 		}
 		// The client is the peer, or an address from the header.
-		if peer, _ := iaddr.Parse(remote); addr != peer && !contains(g.proxies, peer) {
+		if peer, _ := iaddr.Parse(remote); addr != peer && !g.proxies.contains(peer) {
 			t.Fatalf("ClientAddr(%q, %q) = %v from an untrusted peer's header", remote, xff, addr)
 		}
 	})
@@ -519,7 +519,7 @@ func FuzzForwarded(f *testing.F) {
 			}
 			return
 		}
-		if !addr.IsValid() || addr.Zone() != "" || addr.Is4In6() || contains(g.proxies, addr) {
+		if !addr.IsValid() || addr.Zone() != "" || addr.Is4In6() || g.proxies.contains(addr) {
 			t.Fatalf("ClientAddr(%q) = %v", fwd, addr)
 		}
 	})

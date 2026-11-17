@@ -236,20 +236,15 @@ func LocalAdmin() Config {
 	return Config{LoopbackHosts: true, LoopbackPeers: true, RequireOrigin: true, SecurityHeaders: true}
 }
 
-type hostRule struct {
-	host string // lower case, no trailing dot, no brackets
-	port string // empty for any port
-}
-
 // Guard is HTTP middleware; see the package documentation. It is safe for
 // concurrent use. Its zero value is not usable: create one with New.
 type Guard struct {
 	deny          func(http.ResponseWriter, *http.Request, error)
 	cop           *http.CrossOriginProtection
 	forwarded     string // canonical header name
-	hosts         []hostRule
-	peers         []netip.Prefix
-	proxies       []netip.Prefix
+	hosts         hostSet
+	peers         prefixSet
+	proxies       prefixSet
 	loopbackHosts bool
 	loopbackPeers bool
 	requireOrigin bool
@@ -294,7 +289,7 @@ func New(c Config) (*Guard, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: host %q", ErrInvalidConfig, h)
 		}
-		g.hosts = append(g.hosts, hostRule{host: strings.ToLower(host), port: port})
+		g.hosts.add(host, port)
 	}
 	for _, o := range c.TrustedOrigins {
 		if err := g.cop.AddTrustedOrigin(o); err != nil {
@@ -346,7 +341,7 @@ func (g *Guard) Check(r *http.Request) error {
 		if !proxied && g.forwardedFor(r) {
 			return errForwarded
 		}
-		if (!g.loopbackPeers || !a.IsLoopback()) && !contains(g.peers, a) {
+		if (!g.loopbackPeers || !a.IsLoopback()) && !g.peers.contains(a) {
 			return ErrPeer
 		}
 	}
@@ -438,7 +433,7 @@ func (g *Guard) clientAddr(r *http.Request) (netip.Addr, bool, error) {
 	if !ok {
 		return netip.Addr{}, false, ErrClientAddr
 	}
-	if !contains(g.proxies, a) {
+	if !g.proxies.contains(a) {
 		return a, false, nil
 	}
 	values := r.Header[g.forwarded]
@@ -458,7 +453,7 @@ func (g *Guard) clientAddr(r *http.Request) (netip.Addr, bool, error) {
 			if !ok {
 				return netip.Addr{}, true, ErrClientAddr
 			}
-			if !contains(g.proxies, a) {
+			if !g.proxies.contains(a) {
 				return a, true, nil
 			}
 		}
@@ -526,19 +521,29 @@ func validToken(s string) bool {
 	return true
 }
 
-func contains(prefixes []netip.Prefix, a netip.Addr) bool {
-	for _, p := range prefixes {
-		if p.Contains(a) {
-			return true
-		}
+// prefixSet is a set of networks, sorted by address with the networks
+// that others contain removed, so that the networks left are disjoint and
+// a lookup is a binary search. Its size is that of the configuration.
+type prefixSet []netip.Prefix
+
+// contains reports whether a network in s contains a.
+func (s prefixSet) contains(a netip.Addr) bool {
+	// The candidate is the last network that starts at or before a:
+	// a network that starts later cannot contain a, and one that starts
+	// earlier ends before the candidate starts.
+	i, found := slices.BinarySearchFunc(s, a, func(p netip.Prefix, a netip.Addr) int {
+		return p.Addr().Compare(a)
+	})
+	if !found {
+		i--
 	}
-	return false
+	return i >= 0 && s[i].Contains(a)
 }
 
 // parsePrefixes parses "ip" and "ip/bits" entries; IPv4-mapped ones
 // become IPv4, as client addresses are unmapped.
-func parsePrefixes(list []string) ([]netip.Prefix, error) {
-	var out []netip.Prefix
+func parsePrefixes(list []string) (prefixSet, error) {
+	var out prefixSet
 	for _, s := range list {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
@@ -556,7 +561,23 @@ func parsePrefixes(list []string) ([]netip.Prefix, error) {
 		}
 		out = append(out, p.Masked())
 	}
-	return out, nil
+	// Networks are either disjoint or nested. Sorted by address and then
+	// by size, a network is nested exactly when the last one kept
+	// contains its address.
+	slices.SortFunc(out, func(p, q netip.Prefix) int {
+		if c := p.Addr().Compare(q.Addr()); c != 0 {
+			return c
+		}
+		return p.Bits() - q.Bits()
+	})
+	kept := out[:0]
+	for _, p := range out {
+		if n := len(kept); n == 0 || !kept[n-1].Contains(p.Addr()) {
+			kept = append(kept, p)
+		}
+	}
+	clear(out[len(kept):])
+	return slices.Clip(kept), nil
 }
 
 func (g *Guard) allowedHost(h string) bool {
@@ -567,12 +588,68 @@ func (g *Guard) allowedHost(h string) bool {
 	if g.loopbackHosts && loopbackHost(host) {
 		return true
 	}
-	for _, rule := range g.hosts {
-		if strings.EqualFold(rule.host, host) && (rule.port == "" || rule.port == port) {
-			return true
-		}
+	return g.hosts.allows(host, port)
+}
+
+// hostSet holds the allowed hosts in one map. A host allowed on any port
+// is keyed by its lower-case name, one allowed on a single port by the
+// name, a slash and the port: hosts and ports contain no slash. The map
+// grows with the configuration.
+type hostSet struct {
+	rules  map[string]struct{}
+	maxLen int // of the keys, so that longer hosts are rejected early
+}
+
+// add allows host, as splitHost returns it, on port, or on any port when
+// port is empty.
+func (s *hostSet) add(host, port string) {
+	key := strings.ToLower(host)
+	if port != "" {
+		key += "/" + port
 	}
-	return false
+	if s.rules == nil {
+		s.rules = make(map[string]struct{})
+	}
+	s.rules[key] = struct{}{}
+	s.maxLen = max(s.maxLen, len(key))
+}
+
+// hostKeyBuf bounds the keys that allows builds on the stack: a DNS name
+// and a port fit. A longer key, which only a longer configured key can
+// match, is lowered on the heap.
+const hostKeyBuf = 264
+
+// allows reports whether host, as splitHost returns it, is allowed on
+// port. Host names are ASCII, so lowering ASCII letters matches them
+// case-insensitively. It does not allocate for keys within hostKeyBuf.
+func (s *hostSet) allows(host, port string) bool {
+	if len(host) > s.maxLen {
+		return false
+	}
+	var buf [hostKeyBuf]byte
+	var key []byte
+	if n := len(host) + 1 + len(port); n <= len(buf) {
+		key = buf[:0]
+	} else {
+		key = make([]byte, 0, n)
+	}
+	for i := range len(host) {
+		c := host[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		key = append(key, c)
+	}
+	if _, ok := s.rules[string(key)]; ok {
+		return true
+	}
+	if port == "" || len(key)+1+len(port) > s.maxLen {
+		return false
+	}
+	key = append(key, '/')
+	key = append(key, port...)
+	_, ok := s.rules[string(key)]
+	return ok
 }
 
 func loopbackHost(host string) bool {
