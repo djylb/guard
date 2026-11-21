@@ -55,3 +55,13 @@ func Shards(n, capacity, procs int) int {
 	}
 	return n
 }
+
+// SatMul returns a*b for non-negative a and b, saturated at math.MaxInt64.
+// Negative operands give an unspecified result.
+func SatMul(a, b int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b)) //nolint:gosec // G115: the operands are not negative
+	if hi != 0 || lo > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(lo)
+}

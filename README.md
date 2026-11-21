@@ -2,23 +2,26 @@
 
 Security building blocks for Go network services and their admin pages:
 replay protection, proof-of-work challenges, failure limiting and bans,
-one-time passwords, and HTTP middleware against DNS rebinding and CSRF.
+rate limiting, one-time passwords, and HTTP middleware against DNS
+rebinding and CSRF.
 
 - Standard library only, with no dependencies, tests included.
 - Small, focused packages that can be used on their own and compose.
 - No background goroutines: memory is bounded by configuration and
   reclaimed deterministically by the calls that use it.
 - Safe for concurrent use, with sharded locks on the hot paths. Replay,
-  ban, challenge, one-time password, CSRF token and request checks do not
-  allocate, also when they reject. The exceptions are inside the standard
-  library or the caller's code: a cross-origin check of a request that
-  carries Origin but no Sec-Fetch-Site, where `http.CrossOriginProtection`
-  parses the Origin; reading a CSRF token from a form body, which
-  `net/http` parses; and wrapping an error of a custom `pow.Store`.
+  ban, rate limit, challenge, one-time password, CSRF token and request
+  checks do not allocate, also when they reject. The exceptions are inside
+  the standard library or the caller's code: a cross-origin check of a
+  request that carries Origin but no Sec-Fetch-Site, where
+  `http.CrossOriginProtection` parses the Origin; reading a CSRF token from
+  a form body, which `net/http` parses; and wrapping an error of a custom
+  `pow.Store`. A table that is still growing allocates for a new key.
 - Zero values never panic and never run with an empty key: types that
   hold a key report an error, a zero `failban.Limiter` reports every key
-  banned, and a zero `webguard.Guard` or `CSRF` rejects requests.
-  All-zero and short keys are refused.
+  banned, a zero `ratelimit.Limiter` refuses every request, and a zero
+  `webguard.Guard` or `CSRF` rejects requests. All-zero and short keys are
+  refused.
 
 ```
 go get github.com/djylb/guard
@@ -26,13 +29,14 @@ go get github.com/djylb/guard
 
 Requires Go 1.26 or later.
 
-| Package    | Purpose                                                        |
-|------------|----------------------------------------------------------------|
-| `replay`   | Reject a (timestamp, nonce) pair seen within a time window     |
-| `pow`      | Stateless, signed proof-of-work challenges, each usable once   |
-| `failban`  | Count failures per key and ban keys that fail too often        |
-| `otp`      | HOTP and TOTP (RFC 4226, RFC 6238) with replay protection      |
-| `webguard` | net/http middleware: Host allowlist, cross-origin checks, CSRF |
+| Package     | Purpose                                                        |
+|-------------|----------------------------------------------------------------|
+| `replay`    | Reject a (timestamp, nonce) pair seen within a time window     |
+| `pow`       | Stateless, signed proof-of-work challenges, each usable once   |
+| `failban`   | Count failures per key and ban keys that fail too often        |
+| `ratelimit` | Limit events per second per key (GCRA), without allocation     |
+| `otp`       | HOTP and TOTP (RFC 4226, RFC 6238) with replay protection      |
+| `webguard`  | net/http middleware: Host allowlist, cross-origin checks, CSRF |
 
 `pow` uses `replay`; the other packages are independent, and only
 `webguard` imports `net/http`.
@@ -271,6 +275,57 @@ single host may hold billions of addresses. A single `/48` holds 65536
 from filling the ban table. A `PrefixLen` field left at zero means the
 full address, never `/0`. Behind a reverse proxy, key on
 `webguard.Guard.ClientAddr` rather than `RemoteAddr`.
+
+## ratelimit
+
+`Limiter` limits events per string key with the generic cell rate
+algorithm; `GCRA` is the same limit for a single state that you keep in
+your own table.
+
+```go
+l, err := ratelimit.New(ratelimit.Config{Capacity: 1 << 16})
+limit := ratelimit.Rate{Per: 5, Burst: 10} // 5 a second, 10 at once
+
+ok, wait := l.Allow(clientIP, limit, 1, time.Now())
+if !ok {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
+	http.Error(w, "slow down", http.StatusTooManyRequests)
+	return
+}
+l.Penalize(clientIP, limit, 5, time.Now()) // charge a costly request, never refused
+
+var g ratelimit.GCRA // zero value: fresh, full burst; keep it in your own table
+ok, wait = g.Allow(monotonicNanos, limit, 1)
+if g.Idle(monotonicNanos) { // no debt: the entry can be dropped
+	delete(table, clientIP)
+}
+```
+
+- **One state per key, one number.** The state is the theoretical arrival
+  time. A refusal costs nothing, and a request of `n` units is admitted
+  while the key's debt plus `n` intervals stays within `Burst` intervals.
+  `Per <= 0` is unlimited and keeps no state; `Burst` below 1 counts as 1.
+  A request with `n > Burst` is never admitted; `n = 0` asks whether the
+  key is within its burst. The package documentation lists every edge case.
+- **Same limit as a token bucket** of `Burst` tokens refilled at `Per` per
+  second, apart from rounding within a nanosecond, and for a whole
+  `Burst`; `Idle` means the bucket is full again.
+- **Bounded memory.** `Limiter` has 64 independently locked shards, each an
+  LRU of a fixed share of `Capacity` (65536 keys by default). Evicting the
+  least recently used key forgets only its debt, so a flood of new keys
+  can reset other keys' limits but never gets more than a fresh key's burst
+  for itself.
+- **No allocation** per check, refusals included, once a shard is full; a
+  new key allocates only while its shard is still growing towards its
+  share. The limiter keeps the key string it is first given, so do not
+  modify its bytes afterwards.
+- **Clocks.** `Limiter` takes a `time.Time` and measures it from its own
+  creation, on the monotonic clock when the time carries a reading.
+  `GCRA` takes plain nanoseconds from any origin that does not run
+  backwards. No goroutines or timers.
+- The zero `Limiter` refuses everything, unlimited rates included.
+  `Config` and `Rate` decode from JSON (`{"capacity": 65536}`,
+  `{"per": 5, "burst": 10}`).
 
 ## otp
 

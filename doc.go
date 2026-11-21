@@ -8,6 +8,8 @@
 //     their solutions once.
 //   - failban counts failures per key, such as IP prefixes or user names,
 //     and bans keys that fail too often.
+//   - ratelimit limits events per second per key with the generic cell
+//     rate algorithm, with bounded memory and no allocation per check.
 //   - otp implements HOTP and TOTP one-time passwords with replay
 //     protection and otpauth URIs.
 //   - webguard is net/http middleware against DNS rebinding and

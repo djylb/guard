@@ -25,19 +25,20 @@ func TestPackageDependencies(t *testing.T) {
 	addr, clock, conf, num, race, sign := internal+"addr", internal+"clock", internal+"conf", internal+"num", internal+"race", internal+"sign"
 	leakcheck := internal + "leakcheck"
 	allowed := map[string][]string{
-		module:               nil,
-		leakcheck:            nil,
-		addr:                 nil,
-		clock:                nil,
-		conf:                 nil,
-		num:                  nil,
-		race:                 nil,
-		sign:                 {race},
-		module + "/replay":   {clock, conf, num},
-		module + "/pow":      {module + "/replay", clock, conf, num, race, sign},
-		module + "/failban":  {addr, clock, conf, num},
-		module + "/otp":      {conf},
-		module + "/webguard": {addr, conf, num, race, sign},
+		module:                nil,
+		leakcheck:             nil,
+		addr:                  nil,
+		clock:                 nil,
+		conf:                  nil,
+		num:                   nil,
+		race:                  nil,
+		sign:                  {race},
+		module + "/replay":    {clock, conf, num},
+		module + "/pow":       {module + "/replay", clock, conf, num, race, sign},
+		module + "/failban":   {addr, clock, conf, num},
+		module + "/otp":       {conf},
+		module + "/ratelimit": {conf, num, race},
+		module + "/webguard":  {addr, conf, num, race, sign},
 	}
 	listed, err := exec.CommandContext(t.Context(), goCmd, "list", module+"/...").Output()
 	if err != nil {
